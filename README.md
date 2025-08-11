@@ -1,3 +1,3 @@
-# ReadinTime
-UCL MSc Computer Science IXN summer project.
-Based on previous Team 5 NAS Consortium AR Interactive Books project, adding voice cloning feature with NPU support.
+# Compiling
+
+For each of models, there are build instructions in each of the directories in order to compile

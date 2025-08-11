@@ -1,0 +1,21 @@
+# Add directories or file patterns to ignore during indexing (e.g. foo/ or *.csv)
+arbooks-desktop/build/
+arbooks-desktop/dist/
+arbooks-desktop/node_modules/
+arbooks-desktop/.next/
+arbooks-desktop/.turbo/
+arbooks-desktop/.output/
+arbooks-desktop/.cache/
+arbooks-desktop/.eslintcache
+arbooks-desktop/.env
+arbooks-desktop/.env.*
+arbooks-desktop/public/
+arbooks-desktop/coverage/
+arbooks-desktop/yarn.lock
+arbooks-desktop/package-lock.json
+arbooks-desktop/npm-debug.log
+arbooks-desktop/.DS_Store
+arbooks-desktop/*.log
+arbooks-desktop/*.tsbuildinfo
+arbooks-frontend/build/
+arbooks-frontend/dist/

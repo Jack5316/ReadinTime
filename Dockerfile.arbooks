@@ -1,0 +1,15 @@
+FROM python:3.11-slim
+
+WORKDIR /app
+
+# Copy backend
+COPY backend-api/ ./backend-api/
+
+# Install all dependencies in one environment
+RUN pip install --no-cache-dir -r unified_requirements.txt
+
+# Copy built frontend
+COPY arbooks-desktop/dist-electron/ ./frontend/
+
+# Set entry point
+CMD ["python", "backend-api/main.py"]

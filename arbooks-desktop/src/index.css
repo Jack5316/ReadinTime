@@ -1,0 +1,40 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+html, body, #root {
+  height: 100%;
+  min-height: 100vh;
+  background-color: #f8f4e6; /* match cream to avoid black bars on TVs */
+  overflow: hidden; /* prevent any scroll gap revealing OS background */
+}
+
+body { margin: 0; }
+
+@font-face {
+  font-family: "Open-Dyslexic";
+  src: url("./fonts/opendyslexic-regular-webfont.woff2") format("woff2");
+  font-weight: 400;
+  font-style: normal;
+}
+
+@font-face {
+  font-family: "Open-Dyslexic";
+  src: url("./fonts/opendyslexic-bold-webfont.woff2") format("woff2");
+  font-weight: 600;
+  font-style: normal;
+}
+
+@font-face {
+  font-family: "Open-Dyslexic";
+  src: url("src/fonts/opendyslexic-italic-webfont.woff2") format("woff2");
+  font-weight: 400;
+  font-style: italic;
+}
+
+@font-face {
+  font-family: "Open-Dyslexic";
+  src: url("./fonts/opendyslexic-bolditalic-webfont.woff2") format("woff2");
+  font-weight: 600;
+  font-style: italic;
+}
