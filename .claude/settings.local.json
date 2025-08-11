@@ -55,7 +55,10 @@
       "Bash(\"venv-unified\\Scripts\\python.exe\" -m PyInstaller arbooks_unified.spec --clean)",
       "Bash(git init:*)",
       "Bash(git remote add:*)",
-      "Bash(git add:*)"
+      "Bash(git add:*)",
+      "Bash(git rm:*)",
+      "Bash(git fetch:*)",
+      "Bash(git checkout:*)"
     ],
     "deny": []
   }

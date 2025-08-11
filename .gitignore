@@ -184,3 +184,8 @@ yarn.lock
 
 # Ignore null files
 $null
+
+# Third-party source code (embedded repositories)
+backend-api/chatterbox/
+backend-api/markitdown-source/
+backend-api/whisperX-3.4.2/
