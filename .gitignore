@@ -1,0 +1,186 @@
+# Build outputs and distributions
+build/
+dist/
+dist-*/
+win-unpacked/
+*.exe
+*.blockmap
+*.dmg
+*.pkg
+*.snap
+*.AppImage
+
+# Node modules
+node_modules/
+
+# Python virtual environments
+venv/
+venv-*/
+venvs/
+env/
+.env
+
+# Python cache and bytecode
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+*.so
+.pytest_cache/
+
+# PyInstaller
+*.spec
+*.manifest
+*.exe.config
+
+# Build artifacts
+*.toc
+*.pyz
+*.pkg
+base_library.zip
+localpycs/
+warn-*.txt
+xref-*.html
+**/build/
+**/dist/
+**/_internal/
+
+# Test files and outputs
+test_*.py
+test_*.bat
+test_*.ps1
+test_*.html
+test_output/
+**/test_*/
+*.test.js
+
+# Documentation (keeping main README.md and CLAUDE.md)
+BUILD_*.md
+TESTING_*.md
+*_TROUBLESHOOTING.md
+*_FIX.md
+*_GUIDE.md
+SPEC_*.md
+CHATTERBOX_*.md
+WHISPERX_*.md
+MODEL_*.md
+UNIFIED_*.md
+
+# Temporary and cache files
+*.tmp
+*.temp
+*.log
+*.cache
+.DS_Store
+Thumbs.db
+
+# IDE and editor files
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Audio/Video test files
+*.wav
+*.mp3
+*.m4a
+*.mp4
+test_*.*
+sample_*.*
+
+# Model files (large ML models)
+*.bin
+*.pt
+*.pth
+*.safetensors
+chatterbox_models/
+whisperx_models/
+models--*/
+
+# Voice samples directory (if contains personal data)
+voice_samples/
+
+# Electron builder cache
+.electron-builder-cache/
+
+# Logs
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
+# Runtime data
+pids
+*.pid
+*.seed
+*.pid.lock
+
+# Coverage directory used by tools like istanbul
+coverage/
+
+# nyc test coverage
+.nyc_output
+
+# Dependency directories
+jspm_packages/
+
+# Optional npm cache directory
+.npm
+
+# Optional REPL history
+.node_repl_history
+
+# Output of 'npm pack'
+*.tgz
+
+# Yarn Integrity file
+.yarn-integrity
+
+# dotenv environment variables file
+.env.local
+.env.development.local
+.env.test.local
+.env.production.local
+
+# Build scripts (keeping essential ones)
+build_*.bat
+build_*.ps1
+compile_*.py
+install_*.bat
+install_*.ps1
+download_*.py
+prepare_*.py
+debug_*.py
+fix_*.py
+analyze_*.py
+check_*.py
+cleanup_*.ps1
+*_orchestrator.py
+
+# Deployment configs
+netlify.toml
+windsurf_deployment.yaml
+vercel.json
+
+# OS generated files
+.DS_Store?
+ehthumbs.db
+Icon?
+Thumbs.db
+
+# Compiled binary addons
+build/Release
+
+# Dependency lock files (keep package-lock.json but ignore yarn.lock)
+yarn.lock
+
+# Ignore backup files
+*.bak
+*.backup
+
+# Ignore PDF test files
+*.pdf
+
+# Ignore null files
+$null

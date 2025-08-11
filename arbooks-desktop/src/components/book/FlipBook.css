@@ -1,0 +1,242 @@
+@import url('https://fonts.cdnfonts.com/css/opendyslexic');
+
+/* Default highly accessible theme */
+:root {
+  /* Scale the browser root font-size itself so any rem-based element (like icons)
+     automatically grows/shrinks. */
+  font-size: clamp(16px, 0.9vh + 0.4vw, 26px);
+
+  /* Semantic colours & typography */
+  --bg-color: #FFFFFF;
+  --text-color: #000000;
+  --accent-color: #0066CC;
+  --highlight-color: #FFEB3B;
+
+  /* Fluid book sizing – updated by JS & clamp fallback */
+  /* Drive everything from viewport HEIGHT so the pages always fill the screen vertically,
+     regardless of ultra-wide resolutions (e.g. TVs). */
+  --book-padding: clamp(16px, 3vh, 60px);
+  /* Maintain roughly A4 ratio ( √2:1 ~ 1.414 ) – 0.7 × height gives nice aesthetics */
+  --page-h: clamp(500px, 80vh, 1080px);
+  --page-w: clamp(320px, calc(var(--page-h) * 0.70), 768px);
+
+  /* Typography that scales with viewport */
+  --font-size: clamp(14px, 1.0vh + 0.4vw, 28px);
+  --line-height: 1.6;
+  --letter-spacing: 0px;
+  --font-family: 'Verdana', 'Arial', sans-serif;
+}
+
+/* Book container styling */
+.book-reader-container {
+  background: var(--bg-color);
+  height: 100vh;
+  /* vertical centering always; horizontal auto-centering via margins */
+  display: flex;
+  justify-content: center;
+  align-items: center;
+  padding: 0; /* avoid extra vertical space causing bands */
+}
+
+/* HTMLFlipBook container */
+.flipbook-container {
+  height: var(--page-h);
+  width: calc(var(--page-w) * 2);
+  max-width: 100%; /* never overflow horizontally */
+  background: var(--bg-color); /* ensure background fills, avoiding black stripes */
+  box-shadow: 0 30px 60px rgba(0,0,0,0.18); /* soft frame shadow */
+  border-radius: 12px;
+}
+
+.demo-book, .flipbook-container {
+  box-shadow: 0 0 10px rgba(0, 0, 0, 0.2);
+}
+
+/* Individual page */
+.demoPage {
+  background-color: var(--bg-color);
+  color: var(--text-color);
+  display: flex;
+  flex-direction: column;
+  position: relative;
+  overflow: hidden;
+  width: var(--page-w);
+  height: var(--page-h);
+  font-size: var(--font-size);
+  line-height: var(--line-height);
+}
+
+/* Small screens – single page view */
+@media (max-width: 600px) {
+  .flipbook-container { width: var(--page-w); }
+  .demoPage:nth-child(2n) { display: none; }
+}
+
+/* Ultra-wide / TV screens */
+@media (min-width: 1600px) {
+  :root {
+    --book-padding: clamp(24px, 2vw, 80px);
+    --font-size: clamp(16px, 1.5vw, 28px);
+  }
+}
+
+/* Keep existing rules below */
+.demo-book {
+  box-shadow: 0 0 10px rgba(0, 0, 0, 0.2);
+}
+
+/* Base page styling */
+.demoPage {
+  background-color: var(--bg-color);
+  color: var(--text-color);
+  display: flex;
+  flex-direction: column;
+  position: relative;
+  overflow: hidden;
+}
+
+/* Content container */
+.page-content {
+  padding: 30px 35px 40px 35px;
+  /* Fill available space but allow normal text flow */
+  flex: 1 1 auto;
+  display: block;
+  width: 100%;
+  position: relative;
+  z-index: 2;
+  font-size: var(--font-size);
+  line-height: var(--line-height);
+  letter-spacing: var(--letter-spacing);
+  font-family: var(--font-family);
+  text-align: left;
+  /* Single column layout */
+  column-count: 1;
+
+
+  height: 100%;
+  box-sizing: border-box;
+  text-rendering: optimizeLegibility;
+  -webkit-font-smoothing: antialiased;
+  word-spacing: 0.1em;
+  white-space: normal;
+}
+
+/* Text segments */
+.text-segment {
+  margin-right: 0.3em;
+  transition: all 0.3s ease;
+}
+
+.text-segment.active {
+  background-color: rgba(var(--highlight-color), 0.4);
+  padding: 2px 4px;
+  border-radius: 3px;
+}
+
+.text-segment.future {
+  opacity: 0.5;
+}
+
+/* Focus indicators for keyboard navigation */
+button:focus, 
+.clickable:focus {
+  outline: 3px solid var(--accent-color);
+  outline-offset: 2px;
+}
+
+/* Page numbers */
+.page-number {
+  position: absolute;
+  bottom: 18px;
+  font-size: 13px;
+  color: #6b7280;
+  font-family: var(--font-family);
+  z-index: 3;
+  pointer-events: none;
+}
+
+/* Remove busy backgrounds and textures */
+.page-bg, .paper-texture {
+  display: none;
+}
+
+
+
+/* Accessibility themes */
+.theme-high-contrast {
+  --bg-color: #FFFFFF;
+  --text-color: #000000;
+  --accent-color: #0066CC;
+}
+
+.theme-soft {
+  --bg-color: #FFF9E6;
+  --text-color: #2B2B2B;
+  --accent-color: #8B4513;
+}
+
+.theme-dyslexia-friendly {
+  --bg-color: #FFFBF0;
+  --text-color: #3D2914;
+  --font-family: 'OpenDyslexic', 'Comic Sans MS', 'Arial', sans-serif;
+}
+
+/* Accessibility Panel */
+.accessibility-panel {
+  position: fixed;
+  bottom: 20px;
+  right: 20px;
+  background: white;
+  padding: 15px;
+  border-radius: 8px;
+  box-shadow: 0 2px 10px rgba(0, 0, 0, 0.1);
+  z-index: 100;
+  max-width: 300px;
+}
+
+.theme-selector {
+  display: flex;
+  gap: 8px;
+  margin-bottom: 15px;
+}
+
+.theme-selector button {
+  padding: 8px 12px;
+  border: 1px solid #ddd;
+  border-radius: 4px;
+  background: white;
+  cursor: pointer;
+  transition: all 0.2s ease;
+}
+
+.theme-selector button.active {
+  background: var(--accent-color);
+  color: white;
+  border-color: var(--accent-color);
+}
+
+.font-controls {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  margin-bottom: 15px;
+}
+
+.font-controls label {
+  font-size: 14px;
+  color: #555;
+}
+
+.font-controls input[type="range"] {
+  width: 100%;
+}
+
+.accessibility-panel button {
+  padding: 8px 16px;
+  background: var(--accent-color);
+  color: white;
+  border: none;
+  border-radius: 4px;
+  cursor: pointer;
+  font-size: 14px;
+}

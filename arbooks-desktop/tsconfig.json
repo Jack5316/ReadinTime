@@ -1,0 +1,16 @@
+{
+  "compilerOptions": {
+    "outDir": "dist-electron",
+    "target": "esnext",
+    "module": "nodenext",
+    "strict": true,
+    "esModuleInterop": true,
+    "moduleResolution": "nodenext"
+  },
+  "include": [
+    "electron/**/*.ts"
+  ],
+  "exclude": [
+    "node_modules"
+  ]
+}
