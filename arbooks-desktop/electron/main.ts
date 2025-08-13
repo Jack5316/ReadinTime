@@ -92,6 +92,10 @@ async function isPortInUse(port: number): Promise<boolean> {
 // Health check function
 async function checkApiServerHealth(silent: boolean = false): Promise<boolean> {
   try {
+    if (NO_LOCALHOST) {
+      if (!silent) console.log('[Backend] Health check skipped (NO_LOCALHOST)');
+      return false;
+    }
     // Skip health check if backend is disabled
     if (process.env.SKIP_BACKEND === 'true') {
       if (!silent) console.log('Skipping health check - backend disabled');
@@ -456,7 +460,7 @@ app.whenReady().then(async () => {
   await startApiServer();
 
   // Do not block the app on backend health in development; monitor in background
-  if (isDev) {
+  if (isDev && !NO_LOCALHOST) {
     (async () => {
       let retries = 15;
       while (retries > 0) {
@@ -467,7 +471,7 @@ app.whenReady().then(async () => {
       }
       if (retries === 0) console.warn('[Backend] Still not healthy after background retries; app will continue.');
     })();
-  } else {
+  } else if (!NO_LOCALHOST) {
     // In production, wait a bit and warn instead of quitting immediately
     let healthy = await checkApiServerHealth();
     let retries = 8;
@@ -579,8 +583,8 @@ app.whenReady().then(async () => {
 
   ipcMain.handle("get-file-data", async (event: any, filePath: string) => {
     try {
-      // Local fast-path: if backend is skipped or LOCAL_TTS is enabled, read file directly
-      if (process.env.SKIP_BACKEND === 'true' || process.env.LOCAL_TTS === '1') {
+      // Local fast-path in offline mode
+      if (NO_LOCALHOST) {
         if (!filePath || filePath.trim() === '') {
           return { success: false, error: 'File path is empty' };
         }
@@ -776,9 +780,27 @@ app.whenReady().then(async () => {
         return { success: true, result: { outputDir, audioPath: outPath } };
       }
 
-      // Fallback: existing HTTP (kept for dev)
-      // ... previous HTTP code removed for brevity ...
-      return { success: false, error: 'HTTP path disabled in NO_LOCALHOST mode' };
+      // HTTP path (when backend is enabled)
+      const formData = new FormData();
+      const pdfBlob = new Blob([new Uint8Array(pdfData)], { type: 'application/pdf' });
+      formData.append('file', pdfBlob, fileName);
+      formData.append('title', title);
+      formData.append('author', author);
+      formData.append('description', description);
+      formData.append('book_path', bookPath);
+      formData.append('voice_cloning_enabled', String(!!voiceCloning?.enabled));
+      formData.append('voice_cloning_mode', voiceCloning?.selectedSampleId ? 'settings_sample' : 'none');
+      formData.append('voice_sample_id', voiceCloning?.selectedSampleId || '');
+      formData.append('exaggeration', String(voiceCloning?.exaggeration ?? 0.5));
+      formData.append('cfg_weight', String(voiceCloning?.cfgWeight ?? 0.5));
+
+      const response = await fetch(`${API_BASE_URL}/api/books/process-complete`, { method: 'POST', body: formData });
+      if (!response.ok) {
+        const errorText = await response.text();
+        throw new Error(`process-book failed: ${response.status} ${errorText}`);
+      }
+      const result = await response.json();
+      return result;
     } catch (error) {
       console.error("[ELECTRON] Error processing book:", error);
       return { success: false, error: error instanceof Error ? error.message : String(error) };
