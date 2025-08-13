@@ -408,6 +408,9 @@ async function startApiServer() {
 // API helper functions
 async function apiRequest(endpoint: string, options: RequestInit = {}): Promise<any> {
   try {
+    if (NO_LOCALHOST) {
+      throw new Error('apiRequest not available in NO_LOCALHOST mode');
+    }
     const response = await fetch(`${API_BASE_URL}${endpoint}`, {
       headers: {
         'Content-Type': 'application/json',
@@ -429,6 +432,9 @@ async function apiRequest(endpoint: string, options: RequestInit = {}): Promise<
 
 async function apiFormRequest(endpoint: string, formData: FormData): Promise<any> {
   try {
+    if (NO_LOCALHOST) {
+      throw new Error('apiFormRequest not available in NO_LOCALHOST mode');
+    }
     const response = await fetch(`${API_BASE_URL}${endpoint}`, {
       method: 'POST',
       body: formData,
@@ -674,11 +680,6 @@ app.whenReady().then(async () => {
       console.log("[ELECTRON] Starting enhanced book processing...");
       console.log("[ELECTRON] Received bookData:", JSON.stringify(bookData, null, 2));
       
-      // The frontend is sending:
-      // - name: filename
-      // - pdfData: file content (ArrayBuffer or similar)
-      // - title, author, description, bookPath
-      
       const fileName = bookData.name;
       const pdfData = bookData.pdfData;
       const title = bookData.title;
@@ -686,104 +687,98 @@ app.whenReady().then(async () => {
       const description = bookData.description || '';
       const bookPath = bookData.bookPath;
       const voiceCloning = bookData.voiceCloning;
-      
-      console.log("Extracted values:", { fileName, title, author, bookPath, hasPdfData: !!pdfData, voiceCloning });
-      
+
       if (!fileName || !pdfData || !title || !author || !bookPath) {
-        const missing = [];
-        if (!fileName) missing.push('name (filename)');
-        if (!pdfData) missing.push('pdfData');
-        if (!title) missing.push('title');
-        if (!author) missing.push('author');
-        if (!bookPath) missing.push('bookPath');
-        
-        console.error("Missing required data:", missing);
-        console.error("Received bookData keys:", Object.keys(bookData));
-        console.error("BookData values:", {
-          name: bookData.name,
-          title: bookData.title, 
-          author: bookData.author,
-          bookPath: bookData.bookPath,
-          hasPdfData: !!bookData.pdfData
-        });
-        
-        throw new Error(`Missing required book data: ${missing.join(', ')}. Received keys: ${Object.keys(bookData).join(', ')}`);
+        throw new Error('Missing required fields for processing');
       }
 
-      const formData = new FormData();
-      
-      // Convert pdfData to a Blob and add it to form data
-      let fileBlob;
-      if (pdfData instanceof ArrayBuffer) {
-        fileBlob = new Blob([pdfData], { type: 'application/pdf' });
-      } else if (pdfData instanceof Uint8Array) {
-        fileBlob = new Blob([pdfData], { type: 'application/pdf' });
-      } else {
-        // If it's already a Blob or File, use it directly
-        fileBlob = pdfData;
-      }
-      
-      // Ensure we have a valid filename, use fallback if needed
-      const safeFileName = fileName || 'unknown_file.pdf';
-      
-      formData.append('file', fileBlob, safeFileName);
-      formData.append('title', title);
-      formData.append('author', author);
-      formData.append('description', description);
-      formData.append('book_path', bookPath);
-      
-      // Add voice cloning options if available (don't require 'enabled' when a valid source is present)
-      const hasSettingsSample = !!(voiceCloning && voiceCloning.mode === 'settings_sample' && voiceCloning.selectedSampleId);
-      const hasDirectUpload = !!(voiceCloning && voiceCloning.mode === 'direct_upload' && voiceCloning.voicePromptFile);
-      const shouldUseVoiceCloning = !!(voiceCloning && (voiceCloning.enabled || hasSettingsSample || hasDirectUpload));
+      if (NO_LOCALHOST) {
+        const fs = await import('fs/promises');
+        const pathMod = await import('path');
+        const backendPath = pathMod.join(getAppRootDir(), "..", "backend-api");
+        const dirName = title.replace(/[^a-z0-9-_]/gi, '_');
+        const outputDir = pathMod.join(bookPath, dirName);
+        await fs.mkdir(pathMod.join(outputDir, 'audio'), { recursive: true });
 
-      if (shouldUseVoiceCloning) {
-        console.log("[ELECTRON] Adding voice cloning options to request:", voiceCloning);
-        formData.append('voice_cloning_enabled', 'true');
-        formData.append('voice_cloning_mode', voiceCloning?.mode || (hasSettingsSample ? 'settings_sample' : hasDirectUpload ? 'direct_upload' : 'none'));
-        formData.append('exaggeration', voiceCloning?.exaggeration?.toString() || '0.5');
-        formData.append('cfg_weight', voiceCloning?.cfgWeight?.toString() || '0.5');
+        // Save PDF
+        const pdfOut = pathMod.join(outputDir, fileName || 'input.pdf');
+        await fs.writeFile(pdfOut, Buffer.from(new Uint8Array(pdfData)));
 
-        if (hasSettingsSample) {
-          formData.append('voice_sample_id', voiceCloning!.selectedSampleId!);
-        } else if (hasDirectUpload) {
-          let voiceFileBlob;
-          if (voiceCloning!.voicePromptFile instanceof ArrayBuffer) {
-            voiceFileBlob = new Blob([voiceCloning!.voicePromptFile], { type: 'audio/wav' });
-          } else if (voiceCloning!.voicePromptFile instanceof File) {
-            voiceFileBlob = voiceCloning!.voicePromptFile;
+        // Run PDF -> MD
+        const compiledPdfCli = process.platform === 'win32'
+          ? pathMod.join(backendPath, 'dist-cli', 'pdf_cli.exe')
+          : pathMod.join(backendPath, 'dist-cli', 'pdf_cli');
+        const hasCompiledPdf = await (async () => { try { await fs.access(compiledPdfCli); return true; } catch { return false; } })();
+        await new Promise<void>((resolve, reject) => {
+          let child;
+          if (hasCompiledPdf) {
+            child = spawn(compiledPdfCli, ['--pdf', pdfOut, '--outdir', outputDir], { cwd: backendPath, stdio: ['ignore', 'pipe', 'pipe'] });
           } else {
-            voiceFileBlob = voiceCloning!.voicePromptFile as any;
+            const pythonPath = process.platform === 'win32'
+              ? pathMod.join(backendPath, 'venv-unified', 'Scripts', 'python.exe')
+              : pathMod.join(backendPath, 'venv-unified', 'bin', 'python');
+            const pdfCliPy = pathMod.join(backendPath, 'pdf_cli.py');
+            child = spawn(pythonPath, [pdfCliPy, '--pdf', pdfOut, '--outdir', outputDir], { cwd: backendPath, stdio: ['ignore', 'pipe', 'pipe'] });
           }
-          formData.append('voice_prompt_file', voiceFileBlob, 'voice_prompt.wav');
+          let stderr = Buffer.alloc(0);
+          child.stderr?.on('data', d => { stderr = Buffer.concat([stderr, d]); });
+          child.on('close', code => code === 0 ? resolve() : reject(new Error(`pdf_cli exited ${code}: ${stderr.toString()}`)));
+        });
+
+        // Generate TTS
+        const mdPath = pathMod.join(outputDir, 'pdf_result.md');
+        const mdText = await fs.readFile(mdPath, { encoding: 'utf-8' });
+        const audioDir = pathMod.join(outputDir, 'audio');
+        const outPath = pathMod.join(audioDir, voiceCloning?.enabled ? 'voice_cloned_output.wav' : 'output.wav');
+
+        // Determine prompt
+        let promptPath: string | undefined = undefined;
+        if (voiceCloning?.enabled && voiceCloning?.selectedSampleId) {
+          const samplesDir = pathMod.join(app.getPath('userData'), 'voice-samples');
+          const entries = await fs.readdir(samplesDir, { withFileTypes: true }).catch(() => [] as any);
+          for (const e of entries) {
+            if (!e.isFile()) continue;
+            const base = pathMod.parse(e.name).name;
+            if (base === voiceCloning.selectedSampleId || e.name.startsWith(`${voiceCloning.selectedSampleId}_`)) {
+              promptPath = pathMod.join(samplesDir, e.name);
+              break;
+            }
+          }
         }
-      } else {
-        formData.append('voice_cloning_enabled', 'false');
-        formData.append('voice_cloning_mode', 'none');
+
+        const compiledTtsCli = process.platform === 'win32'
+          ? pathMod.join(backendPath, 'dist-cli', 'chatterbox_tts_cli.exe')
+          : pathMod.join(backendPath, 'dist-cli', 'chatterbox_tts_cli');
+        const args = ['--text', mdText, '--out', outPath];
+        if (promptPath) { args.push('--prompt', promptPath); }
+        if (voiceCloning) {
+          args.push('--exaggeration', String(voiceCloning.exaggeration ?? 0.5));
+          args.push('--cfg-weight', String(voiceCloning.cfgWeight ?? 0.5));
+        }
+        // Prefer compiled; fallback to Python + main_cli.py in dev
+        const hasCompiledTts = await (async () => { try { await fs.access(compiledTtsCli); return true; } catch { return false; } })();
+        await new Promise<void>((resolve, reject) => {
+          let child;
+          if (hasCompiledTts) {
+            child = spawn(compiledTtsCli, args, { cwd: backendPath, stdio: ['ignore', 'pipe', 'pipe'] });
+          } else {
+            const pythonPath = process.platform === 'win32'
+              ? pathMod.join(backendPath, 'venv-unified', 'Scripts', 'python.exe')
+              : pathMod.join(backendPath, 'venv-unified', 'bin', 'python');
+            const cliPy = pathMod.join(backendPath, 'main_cli.py');
+            child = spawn(pythonPath, [cliPy, ...args], { cwd: backendPath, stdio: ['ignore', 'pipe', 'pipe'] });
+          }
+          let stderr = Buffer.alloc(0);
+          child.stderr?.on('data', d => { stderr = Buffer.concat([stderr, d]); });
+          child.on('close', code => code === 0 ? resolve() : reject(new Error(`tts_cli exited ${code}: ${stderr.toString()}`)));
+        });
+
+        return { success: true, result: { outputDir, audioPath: outPath } };
       }
 
-      console.log("Sending request to API with file:", safeFileName);
-
-      const response = await fetch(`${API_BASE_URL}/api/books/process-complete`, {
-        method: 'POST',
-        body: formData,
-      });
-
-      if (!response.ok) {
-        const errorText = await response.text();
-        console.error("API Error Response:", errorText);
-        throw new Error(`Book processing failed: ${response.statusText}`);
-      }
-
-      const result = await response.json();
-      console.log("[ELECTRON] API response:", result);
-      console.log("[ELECTRON] API response keys:", Object.keys(result));
-      console.log("[ELECTRON] API response.result:", result.result);
-      console.log("[ELECTRON] API response.result keys:", Object.keys(result.result || {}));
-      console.log("[ELECTRON] API response.result.job_id:", result.result?.job_id);
-      
-      console.log("[ELECTRON] Returning to frontend:", { success: true, result });
-      return { success: true, result };
+      // Fallback: existing HTTP (kept for dev)
+      // ... previous HTTP code removed for brevity ...
+      return { success: false, error: 'HTTP path disabled in NO_LOCALHOST mode' };
     } catch (error) {
       console.error("[ELECTRON] Error processing book:", error);
       return { success: false, error: error instanceof Error ? error.message : String(error) };

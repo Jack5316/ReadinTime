@@ -51,7 +51,7 @@ def main():
         args.text,
         audio_prompt_path=args.prompt,
         exaggeration=args.exaggeration,
-        cfg_weight=args["cfg-weight"] if isinstance(args, dict) else args.cfg_weight,
+        cfg_weight=args.cfg_weight,
     )
 
     out_path = Path(args.out)
