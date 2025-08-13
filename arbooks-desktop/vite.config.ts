@@ -6,7 +6,7 @@ import renderer from 'vite-plugin-electron-renderer';
 import { copyFileSync, mkdirSync, readdirSync, statSync, existsSync } from 'fs';
 
 export default defineConfig({
-  base: "./",
+  base: process.env.ELECTRON_RENDERER_URL ? undefined : "./",
   resolve: {
     alias: {
       '@': path.resolve(__dirname, './src'),

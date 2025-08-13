@@ -9,12 +9,13 @@ interface AppState {
   removeVoiceSample: (voiceSampleId: string) => void;
   selectVoiceSample: (voiceSampleId: string | null) => void;
   updateVoiceSample: (voiceSampleId: string, updates: Partial<VoiceSample>) => void;
+  loadVoiceSamples: (voiceSamples: VoiceSample[]) => void;
 }
 
 const defaultSettings: SettingsState = {
   mode: 'Speech and Images',
   fontSize: 18,
-  fontStyle: 'Open-Dyslexic',
+  fontStyle: 'Source Serif 4',
   fontColour: 'black',
   bgColour: 'white',
   lineSpacing: 1.5,
@@ -119,6 +120,7 @@ const useStore = create<AppState>()(
         },
         
         selectVoiceSample: (voiceSampleId) => {
+          console.log('Store: Selecting voice sample:', voiceSampleId);
           const currentSettings = get().settings;
           const updatedSettings = {
             ...currentSettings,
@@ -127,6 +129,34 @@ const useStore = create<AppState>()(
               selectedVoiceSampleId: voiceSampleId
             }
           };
+          console.log('Store: Updated settings:', updatedSettings.voiceCloning);
+          set({ settings: updatedSettings });
+        },
+
+        loadVoiceSamples: (voiceSamples) => {
+          console.log('Store: Loading voice samples:', voiceSamples.length);
+          const currentSettings = get().settings;
+          const currentSelectedId = currentSettings.voiceCloning?.selectedVoiceSampleId;
+          
+          // Check if the currently selected voice sample still exists in the loaded samples
+          const selectedIdExists = currentSelectedId && voiceSamples.some(sample => sample.id === currentSelectedId);
+          
+          console.log('Store: Voice sample selection check:', {
+            currentSelectedId,
+            selectedIdExists,
+            availableIds: voiceSamples.map(s => s.id)
+          });
+          
+          const updatedSettings = {
+            ...currentSettings,
+            voiceCloning: {
+              ...currentSettings.voiceCloning,
+              voiceSamples: voiceSamples,
+              // Only preserve the selected voice sample ID if it still exists in the loaded samples
+              selectedVoiceSampleId: selectedIdExists ? currentSelectedId : null,
+            }
+          };
+          console.log('Store: Updated voice cloning settings:', updatedSettings.voiceCloning);
           set({ settings: updatedSettings });
         },
         

@@ -28,6 +28,7 @@ interface ElectronAPI {
   // Voice samples directory management
   getVoiceSamplesDirectory: () => Promise<Result<string>>;
   setVoiceSamplesDirectory: (directory: string) => Promise<Result<void>>;
+  listVoiceSamples: () => Promise<Result<VoiceSample[]>>;
 }
 
 interface Window {

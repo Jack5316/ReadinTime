@@ -37,6 +37,7 @@ const electronAPI = {
   // Voice samples directory management
   getVoiceSamplesDirectory: () => ipcRenderer.invoke("get-voice-samples-directory"),
   setVoiceSamplesDirectory: (directory: string) => ipcRenderer.invoke("set-voice-samples-directory", directory),
+  listVoiceSamples: () => ipcRenderer.invoke("list-voice-samples"),
 
   // Window controls
   toggleKiosk: () => ipcRenderer.invoke('toggle-kiosk'),

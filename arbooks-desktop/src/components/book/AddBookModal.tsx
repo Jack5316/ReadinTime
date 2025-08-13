@@ -216,11 +216,8 @@ const AddBookModal = forwardRef<HTMLDialogElement, {}>((props, addBookModalRef) 
       return;
     }
     
-    // Check if settings-based voice cloning is properly configured
-    if (voiceCloning.enabled && !voiceCloning.selectedVoiceSampleId) {
-      setError("Please select a voice sample in Settings for voice cloning");
-      return;
-    }
+    // If voice cloning via settings is enabled but no sample is selected,
+    // fall back to regular TTS instead of blocking the upload.
 
     const reader = new FileReader();
     reader.onload = async () => {

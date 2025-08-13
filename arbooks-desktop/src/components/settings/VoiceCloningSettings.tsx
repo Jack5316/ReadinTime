@@ -20,7 +20,9 @@ const VoiceCloningSettings: FC = () => {
   const [editingId, setEditingId] = useState<string | null>(null);
   const [editName, setEditName] = useState('');
   const [newlyAddedId, setNewlyAddedId] = useState<string | null>(null);
-  const [isLoading, setIsLoading] = useState(true);
+  // Avoid blocking the whole panel; render immediately
+  const [isLoading, setIsLoading] = useState(false);
+  const [isLoadingVoiceSamples, setIsLoadingVoiceSamples] = useState(false);
   const [connectionError, setConnectionError] = useState<string | null>(null);
   const [successMessage, setSuccessMessage] = useState<string | null>(null);
   const [voiceSamplesDirectory, setVoiceSamplesDirectory] = useState<string | { directory: string } | null>(null);
@@ -42,21 +44,38 @@ const VoiceCloningSettings: FC = () => {
     removeVoiceSample,
     selectVoiceSample,
     updateVoiceSample,
+    loadVoiceSamples,
   } = useStore();
 
-  const storeRef = useRef({ settings, updateSettings, addVoiceSample, removeVoiceSample, selectVoiceSample, updateVoiceSample });
+  const storeRef = useRef({ settings, updateSettings, addVoiceSample, removeVoiceSample, selectVoiceSample, updateVoiceSample, loadVoiceSamples });
   useEffect(() => {
-    storeRef.current = { settings, updateSettings, addVoiceSample, removeVoiceSample, selectVoiceSample, updateVoiceSample };
-  }, [settings, updateSettings, addVoiceSample, removeVoiceSample, selectVoiceSample, updateVoiceSample]);
+    storeRef.current = { settings, updateSettings, addVoiceSample, removeVoiceSample, selectVoiceSample, updateVoiceSample, loadVoiceSamples };
+  }, [settings, updateSettings, addVoiceSample, removeVoiceSample, selectVoiceSample, updateVoiceSample, loadVoiceSamples]);
 
   const isElectronAvailable = typeof window !== 'undefined' && !!window.electron;
 
+  const loadVoiceSamplesFromBackend = useCallback(async () => {
+    if (!isElectronAvailable || !window.electron?.listVoiceSamples) return;
+    try {
+      setIsLoadingVoiceSamples(true);
+      const result = await window.electron.listVoiceSamples();
+      if (result.success && Array.isArray(result.result)) {
+        storeRef.current.loadVoiceSamples?.(result.result);
+        if (result.result.length > 0) {
+          setSuccessMessage(`Loaded ${result.result.length} voice sample(s)`);
+          setTimeout(() => setSuccessMessage(null), 2000);
+        }
+      }
+    } catch (error) {
+      console.warn('Failed to load voice samples from backend:', error);
+    } finally {
+      setIsLoadingVoiceSamples(false);
+    }
+  }, [isElectronAvailable]);
+
   const initializeComponent = useCallback(async () => {
     try {
-      setIsLoading(true);
       setConnectionError(null);
-
-      await new Promise(resolve => setTimeout(resolve, 100));
 
       const currentSettings = storeRef.current.settings;
       if (!currentSettings) {
@@ -81,28 +100,40 @@ const VoiceCloningSettings: FC = () => {
           voiceCloning: {
             ...currentSettings.voiceCloning,
             voiceSamples: [],
+            // Preserve the selected voice sample ID when resetting the array
+            selectedVoiceSampleId: currentSettings.voiceCloning.selectedVoiceSampleId,
           },
         });
       }
 
-      if (isElectronAvailable && window.electron?.getVoiceSamplesDirectory) {
-        try {
-          const result = (await window.electron.getVoiceSamplesDirectory()) as unknown as Result<{ directory: string }>;
-          if (result.success && result.result.directory) {
-            setVoiceSamplesDirectory(result.result.directory);
-          }
-        } catch (error) {
-          console.warn('Failed to get voice samples directory:', error);
-        }
+      // Directory: use cached value first, then fetch lazily if missing
+      if (typeof currentSettings.voiceSamplesDirectory === 'string') {
+        setVoiceSamplesDirectory(currentSettings.voiceSamplesDirectory);
+      } else if (isElectronAvailable && window.electron?.getVoiceSamplesDirectory) {
+        window.electron.getVoiceSamplesDirectory()
+          .then((res: any) => {
+            const dir = res?.result?.directory || res?.directory;
+            if (dir) {
+              setVoiceSamplesDirectory(dir);
+              const cur = storeRef.current.settings;
+              storeRef.current.updateSettings?.({ ...cur, voiceSamplesDirectory: dir });
+            }
+          })
+          .catch(() => {});
+      }
+
+      // Voice samples: show cached immediately; refresh in background if empty
+      const cached = currentSettings.voiceCloning?.voiceSamples || [];
+      if (!Array.isArray(cached) || cached.length === 0) {
+        loadVoiceSamplesFromBackend();
       }
     } catch (error) {
       console.error('Component initialization failed:', error);
       setConnectionError(`Settings initialization failed: ${error instanceof Error ? error.message : 'Unknown error'}`);
     } finally {
-      setIsLoading(false);
       setIsInitialized(true);
     }
-  }, [isElectronAvailable]);
+  }, [isElectronAvailable, loadVoiceSamplesFromBackend]);
 
   useEffect(() => {
     if (!isInitialized) {
@@ -181,6 +212,7 @@ const VoiceCloningSettings: FC = () => {
   };
 
   const handleSelectVoiceSample = (id: string) => {
+    console.log('Selecting voice sample:', id);
     storeRef.current.selectVoiceSample?.(id);
   };
 
@@ -206,9 +238,25 @@ const VoiceCloningSettings: FC = () => {
     setTimeout(() => setSuccessMessage(null), 3000);
   };
 
-  const handleDeleteVoiceSample = (id: string) => {
-    if (window.confirm('Are you sure you want to delete this voice sample?')) {
+  const [isDeletingId, setIsDeletingId] = useState<string | null>(null);
+
+  const handleDeleteVoiceSample = async (id: string) => {
+    if (!window.confirm('Are you sure you want to delete this voice sample?')) return;
+    try {
+      setIsDeletingId(id);
+      if (isElectronAvailable && window.electron?.deleteVoiceSample) {
+        const result = await window.electron.deleteVoiceSample(id) as unknown as Result<any>;
+        if (!result?.success) {
+          throw new Error(result?.error || 'Delete failed');
+        }
+      }
       storeRef.current.removeVoiceSample?.(id);
+      setSuccessMessage('Voice sample deleted');
+      setTimeout(() => setSuccessMessage(null), 2000);
+    } catch (error) {
+      setConnectionError(error instanceof Error ? error.message : 'Failed to delete voice sample');
+    } finally {
+      setIsDeletingId(null);
     }
   };
 
@@ -220,7 +268,12 @@ const VoiceCloningSettings: FC = () => {
         const newDirectory = dirResult.result;
         const setResult = await window.electron.setVoiceSamplesDirectory(newDirectory);
         if (setResult.success) {
-          setVoiceSamplesDirectory(newDirectory);
+          const anyResult: any = setResult as any;
+          const dir = typeof anyResult.result === 'string' ? anyResult.result : (anyResult.result?.directory || newDirectory);
+          setVoiceSamplesDirectory(dir);
+          // Persist into global settings so it survives navigation
+          const cur = storeRef.current.settings;
+          storeRef.current.updateSettings?.({ ...cur, voiceSamplesDirectory: dir });
           setSuccessMessage('Directory updated successfully.');
           setTimeout(() => setSuccessMessage(null), 3000);
         } else {
@@ -232,7 +285,7 @@ const VoiceCloningSettings: FC = () => {
     }
   };
 
-  if (isLoading) return <div className="flex justify-center items-center p-8"><span className="loading loading-lg"></span></div>;
+  // Do not block UI on initialization
 
   if (connectionError) return (
     <div className="alert alert-error">
@@ -249,6 +302,14 @@ const VoiceCloningSettings: FC = () => {
 
   const { voiceCloning } = settings;
   const voiceSamples = voiceCloning.voiceSamples || [];
+  
+  // Debug logging
+  console.log('VoiceCloningSettings render:', {
+    voiceCloning,
+    voiceSamples: voiceSamples.length,
+    selectedVoiceSampleId: voiceCloning.selectedVoiceSampleId,
+    hasSelectedSample: voiceCloning.selectedVoiceSampleId && voiceSamples.some(s => s.id === voiceCloning.selectedVoiceSampleId)
+  });
 
   return (
     <div className="space-y-3 p-3">
@@ -284,9 +345,30 @@ const VoiceCloningSettings: FC = () => {
 
           {/* Voice Library (always visible) */}
           <div className="space-y-3 p-3 border border-base-300 rounded-lg">
-            <h3 className="text-lg font-medium">Voice Library</h3>
+            <div className="flex items-center justify-between">
+              <h3 className="text-lg font-medium">Voice Library</h3>
+              <button 
+                className="btn btn-sm btn-outline" 
+                onClick={() => loadVoiceSamplesFromBackend()}
+                disabled={isLoadingVoiceSamples}
+                title="Refresh voice samples from backend"
+              >
+                {isLoadingVoiceSamples ? (
+                  <span className="loading loading-spinner loading-xs"></span>
+                ) : (
+                  <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                    <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15" />
+                  </svg>
+                )}
+              </button>
+            </div>
             <div className="space-y-2">
-              {voiceSamples.length === 0 ? (
+              {isLoadingVoiceSamples ? (
+                <div className="text-center text-base-content/60 py-4">
+                  <span className="loading loading-spinner loading-sm mr-2"></span>
+                  Loading voice samples...
+                </div>
+              ) : voiceSamples.length === 0 ? (
                 <div className="text-center text-base-content/60 py-4">No voice samples added.</div>
               ) : (
                 voiceSamples.map((sample) => (
@@ -328,7 +410,9 @@ const VoiceCloningSettings: FC = () => {
                     {editingId !== sample.id && (
                       <div className="flex items-center gap-2 flex-shrink-0">
                         <button className="btn btn-ghost btn-sm" onClick={() => handleStartEdit(sample)}>Rename</button>
-                        <button className="btn btn-ghost btn-sm text-error" onClick={() => handleDeleteVoiceSample(sample.id)}>Delete</button>
+                        <button className={`btn btn-ghost btn-sm text-error ${isDeletingId===sample.id ? 'loading' : ''}`} disabled={isDeletingId===sample.id} onClick={() => handleDeleteVoiceSample(sample.id)}>
+                          {isDeletingId===sample.id ? '' : 'Delete'}
+                        </button>
                       </div>
                     )}
                   </div>
