@@ -11,6 +11,7 @@ import json
 import gc
 import weakref
 import time
+import textwrap
 
 # Note: torch/torchaudio imports are handled within subprocess execution
 # to avoid dependency conflicts with the main environment
@@ -32,15 +33,52 @@ class ChatterboxTTSService:
         # for this many seconds (default 5 minutes). This prevents repeated crashes
         # from health probes that call this endpoint frequently.
         self._availability_cooldown_seconds: int = 300
-        # Inference/device controls (CPU-first by default)
-        self._inference_device = os.getenv('CHB_TTS_DEVICE', 'cpu').lower()
+        # Inference/device controls (GPU-first by default, fallback to CPU)
+        self._inference_device = os.getenv('CHB_TTS_DEVICE', 'cuda').lower()
         if self._inference_device not in ('cpu', 'cuda'):
-            self._inference_device = 'cpu'
+            self._inference_device = 'cuda'
+        
+        # Check if CUDA is actually available, fallback to CPU if not
+        if self._inference_device == 'cuda':
+            try:
+                import torch
+                if not torch.cuda.is_available():
+                    self.logger.warning("CUDA requested but not available, falling back to CPU")
+                    self._inference_device = 'cpu'
+                else:
+                    self.logger.info(f"Using CUDA device: {torch.cuda.get_device_name(0)}")
+            except ImportError:
+                self.logger.warning("PyTorch not available, falling back to CPU")
+                self._inference_device = 'cpu'
+        
+        # If using CPU, hide GPUs from all child processes to avoid CUDA init errors
+        if self._inference_device == 'cpu':
+            os.environ['CUDA_VISIBLE_DEVICES'] = ''
+            self.logger.info("Using CPU for TTS generation")
         # Optionally lower audio sample rate to reduce memory/disk usage (e.g., 22050)
         self._target_sample_rate = int(os.getenv('CHB_TTS_SR', '0')) or None
         # Release strategy: process-per-chunk (dev) is memory-safe; cached (frozen) for speed
         self._release_strategy = os.getenv('CHB_TTS_RELEASE', 'process_per_chunk')
         self._setup_paths()
+    
+    def _check_system_memory(self) -> bool:
+        """Check if system has sufficient memory for TTS processing"""
+        try:
+            import psutil
+            memory = psutil.virtual_memory()
+            available_gb = memory.available / (1024**3)
+            used_percent = memory.percent
+            
+            self.logger.info(f"System memory: {available_gb:.1f} GB available, {used_percent:.1f}% used")
+            
+            # Require at least 2GB available and less than 90% used
+            if available_gb < 2.0 or used_percent > 90:
+                self.logger.warning(f"Insufficient memory: {available_gb:.1f} GB available, {used_percent:.1f}% used")
+                return False
+            return True
+        except Exception as e:
+            self.logger.warning(f"Could not check system memory: {e}")
+            return True  # Assume OK if we can't check
     
     def _setup_paths(self):
         """Setup paths for unified virtual environment."""
@@ -52,7 +90,7 @@ class ChatterboxTTSService:
             self.logger.info(f"Running in frozen executable, using bundled Python: {self.python_path}")
             self.is_frozen = True
             try:        
-                import chatterbox.tts
+                import chatterbox.tts  # type: ignore[reportMissingImports]
                 self.logger.info("Chatterbox TTS imported successfully in frozen environment")
             except ImportError as e:
                 self.logger.error("PyInstaller bundle is missing chatterbox.tts")
@@ -97,7 +135,7 @@ class ChatterboxTTSService:
                         os.environ['PYTORCH_CUDA_ALLOC_CONF'] = 'max_split_size_mb:128'
                         os.environ['TOKENIZERS_PARALLELISM'] = 'false'
                         
-                        from chatterbox.tts import ChatterboxTTS
+                        from chatterbox.tts import ChatterboxTTS  # type: ignore[reportMissingImports]
                         
                         # Force garbage collection before loading
                         gc.collect()
@@ -224,7 +262,7 @@ class ChatterboxTTSService:
             if self.is_frozen:
                 # In frozen environment, test imports directly
                 try:
-                    from chatterbox.tts import ChatterboxTTS
+                    from chatterbox.tts import ChatterboxTTS  # type: ignore[reportMissingImports]
                     self.logger.info("ChatterboxTTS imported successfully in frozen environment")
                     
                     # For quick checks, do not attempt to load the model
@@ -256,7 +294,7 @@ class ChatterboxTTSService:
                             return True
                         else:
                             # Test loading without caching
-                            model = ChatterboxTTS.from_pretrained(device="cpu")
+                            model = ChatterboxTTS.from_pretrained(device=self._inference_device)
                             del model
                             gc.collect()
                             self.logger.info("Chatterbox TTS model loaded successfully in frozen environment")
@@ -332,7 +370,7 @@ try:
     gc.collect()
     
     # Load model with CPU device (should use less memory)
-    model = ChatterboxTTS.from_pretrained(device="cpu")
+            model = ChatterboxTTS.from_pretrained(device=self._inference_device)
     print('CHATTERBOX_MODEL_OK')
     
     # Clean up immediately
@@ -419,11 +457,11 @@ finally:
         
         return text
     
-    def _split_text_into_chunks(self, text: str, max_chunk_size: int = 300) -> list:
+    def _split_text_into_chunks(self, text: str, max_chunk_size: int = 200) -> list:
         """
         Split text into smaller chunks suitable for TTS processing.
         Chatterbox TTS works better with shorter text segments.
-        Reduced default chunk size to 300 for better stability and faster processing.
+        Reduced default chunk size to 200 for better stability and lower memory usage.
         """
         if len(text) <= max_chunk_size:
             return [text]
@@ -461,9 +499,9 @@ finally:
         temp_chunk = ""
         
         for chunk in chunks:
-            if len(chunk) < 30 and temp_chunk:  # Merge very short chunks (reduced from 50 to 30)
+            if len(chunk) < 20 and temp_chunk:  # Merge very short chunks (reduced from 30 to 20)
                 temp_chunk += " " + chunk
-            elif len(chunk) < 30:
+            elif len(chunk) < 20:
                 temp_chunk = chunk
             else:
                 if temp_chunk:
@@ -502,6 +540,13 @@ finally:
             return {
                 "success": False, 
                 "error": "Chatterbox TTS model not available"
+            }
+        
+        # Check system memory before processing
+        if not self._check_system_memory():
+            return {
+                "success": False,
+                "error": "Insufficient system memory for TTS processing. Please close other applications and try again."
             }
         
         try:
@@ -570,6 +615,13 @@ finally:
         try:
             self.logger.info(f"Generating speech for single chunk: {len(text)} characters")
             
+            # Check memory before processing
+            if not self._check_system_memory():
+                return {
+                    "success": False,
+                    "error": "Insufficient system memory for TTS processing. Please close other applications and try again."
+                }
+            
             # Ensure output directory exists
             output_dir = os.path.dirname(output_path)
             if output_dir:
@@ -591,32 +643,42 @@ finally:
                 text_file_path = text_file.name
             
             # Create TTS generation script that reads from the text file
-            # Derive device and target SR for the subprocess
-            device = self._inference_device or 'cpu'
+            # Force CPU device in dev mode to avoid CUDA issues
+            device = 'cpu'
+            # Ensure subprocess cannot see any CUDA devices
+            os.environ['CUDA_VISIBLE_DEVICES'] = ''
             target_sr = self._target_sample_rate or 0
 
-            tts_script = f'''
- import os
- # Set CPU/GPU env BEFORE importing torch/torchaudio for stability
- if {json.dumps(device)} == "cpu":
-     os.environ["CUDA_VISIBLE_DEVICES"] = ""
-     os.environ["PYTORCH_ENABLE_MPS_FALLBACK"] = "1"
- os.environ.setdefault("OMP_NUM_THREADS", "1")
- os.environ.setdefault("MKL_NUM_THREADS", "1")
- os.environ.setdefault("OPENBLAS_NUM_THREADS", "1")
- os.environ.setdefault("NUMEXPR_NUM_THREADS", "1")
- os.environ.setdefault("KMP_AFFINITY", "disabled")
- os.environ.setdefault("KMP_DUPLICATE_LIB_OK", "TRUE")
- import sys
- import warnings
- import gc
- import json
- import tempfile
- import psutil
- import torch
- import torchaudio
- import wave
- import numpy as np
+            tts_script_raw = f'''
+import os
+# Set CPU/GPU env BEFORE importing torch/torchaudio for stability
+if {json.dumps(device)} == "cpu":
+    os.environ["CUDA_VISIBLE_DEVICES"] = ""
+    os.environ["PYTORCH_ENABLE_MPS_FALLBACK"] = "1"
+os.environ.setdefault("OMP_NUM_THREADS", "1")
+os.environ.setdefault("MKL_NUM_THREADS", "1")
+os.environ.setdefault("OPENBLAS_NUM_THREADS", "1")
+os.environ.setdefault("NUMEXPR_NUM_THREADS", "1")
+os.environ.setdefault("KMP_AFFINITY", "disabled")
+os.environ.setdefault("KMP_DUPLICATE_LIB_OK", "TRUE")
+# Aggressive memory management
+os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "max_split_size_mb:128")
+os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
+import sys
+import warnings
+import gc
+import json
+import tempfile
+import psutil
+import torch
+import wave
+import numpy as np
+HAS_TORCHAUDIO = False
+try:
+    import torchaudio
+    HAS_TORCHAUDIO = True
+except Exception as e:
+    print("torchaudio import failed; continuing without it: " + str(e))
 
 # Suppress warnings
 warnings.filterwarnings("ignore", category=FutureWarning)
@@ -625,13 +687,73 @@ import logging
 logging.getLogger("transformers").setLevel(logging.ERROR)
 
 def log_memory_usage(stage):
-    """Log current memory usage"""
-    process = psutil.Process()
-    memory_info = process.memory_info()
-    print(f"[{{stage}}] Memory: {{memory_info.rss / 1024 / 1024:.1f}} MB RSS, {{memory_info.vms / 1024 / 1024:.1f}} MB VMS")
+    """Log current memory usage with more detail"""
+    try:
+        process = psutil.Process()
+        memory_info = process.memory_info()
+        memory_percent = process.memory_percent()
+        print(f"[{{stage}}] Memory: {{memory_info.rss / 1024 / 1024:.1f}} MB RSS, {{memory_info.vms / 1024 / 1024:.1f}} MB VMS, {{memory_percent:.1f}}%")
+        
+        # Log system memory if available
+        try:
+            system_memory = psutil.virtual_memory()
+            print(f"[{{stage}}] System: {{system_memory.available / 1024 / 1024 / 1024:.1f}} GB available, {{system_memory.percent:.1f}}% used")
+            
+            # Check if we're running out of memory
+            if system_memory.percent > 95 or system_memory.available < 1.0 * (1024**3):  # Less than 1GB available
+                print(f"WARNING: System memory critically low! {{system_memory.percent:.1f}}% used, {{system_memory.available / (1024**3):.1f}} GB available")
+                return False
+        except:
+            pass
+        return True
+    except Exception as e:
+        print(f"[{{stage}}] Memory logging failed: {{e}}")
+        return True
+
+def check_memory_limit():
+    """Check if current memory usage is within safe limits"""
+    try:
+        process = psutil.Process()
+        memory_info = process.memory_info()
+        memory_gb = memory_info.rss / (1024**3)
+        
+        # Limit process memory to 4GB to prevent crashes
+        if memory_gb > 4.0:
+            print(f"ERROR: Process memory usage too high: {{memory_gb:.1f}} GB. Stopping to prevent crash.")
+            return False
+        return True
+    except Exception as e:
+        print(f"Memory limit check failed: {{e}}")
+        return True
+
+def force_memory_cleanup():
+    """Aggressively clean up memory"""
+    try:
+        # Force garbage collection
+        gc.collect()
+        
+        # Clear PyTorch cache if available
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+        
+        # Clear any other caches
+        if hasattr(torch, 'jit'):
+            torch.jit._state._python_cu.clear_cache()
+        
+        print("Memory cleanup completed")
+    except Exception as e:
+        print(f"Memory cleanup failed: {{e}}")
 
 try:
     log_memory_usage("Start")
+    
+    # Check initial memory limits
+    if not check_memory_limit():
+        print("ERROR: Initial memory usage too high, aborting")
+        sys.exit(1)
+    
+    # Force initial cleanup
+    force_memory_cleanup()
     
     from chatterbox.tts import ChatterboxTTS
 
@@ -647,7 +769,7 @@ try:
     os.environ.setdefault("NUMEXPR_NUM_THREADS", "1")
     os.environ.setdefault("KMP_AFFINITY", "disabled")
     os.environ.setdefault("KMP_DUPLICATE_LIB_OK", "TRUE")
-    print(f"Using device: {device}")
+    print(f"Using device: {{device}}")
 
     # Clear any existing CUDA cache and force aggressive cleanup
     try:
@@ -667,16 +789,36 @@ try:
         pass
 
     # Force garbage collection before loading
-    gc.collect()
+    force_memory_cleanup()
 
     log_memory_usage("Before model load")
     
+    # Check memory before loading model
+    if not check_memory_limit():
+        print("ERROR: Memory usage too high before model load, aborting")
+        sys.exit(1)
+    
     # Load the model with explicit memory management
     print("Loading Chatterbox TTS model...")
-    model = ChatterboxTTS.from_pretrained(device=device)
-    print("Model loaded successfully")
+    try:
+        model = ChatterboxTTS.from_pretrained(device=device)
+        print("Model loaded successfully")
+    except Exception as e:
+        print(f"Model loading failed: {{e}}")
+        # Try to free memory and retry once
+        force_memory_cleanup()
+        if not check_memory_limit():
+            print("ERROR: Memory still too high after cleanup, aborting")
+            sys.exit(1)
+        model = ChatterboxTTS.from_pretrained(device=device)
+        print("Model loaded successfully on retry")
     
     log_memory_usage("After model load")
+    
+    # Check memory after model load
+    if not check_memory_limit():
+        print("ERROR: Memory usage too high after model load, aborting")
+        sys.exit(1)
     
     # Read text from file to avoid command line length limits
     text_file_path = r"{text_file_path}"
@@ -693,9 +835,16 @@ try:
     
     log_memory_usage("Before generation")
 
+    # Check memory before generation
+    if not check_memory_limit():
+        print("ERROR: Memory usage too high before generation, aborting")
+        sys.exit(1)
+
     # Preprocess voice prompt to reduce memory usage (mono, 16kHz, <=3s)
     if audio_prompt_path and audio_prompt_path != "None" and os.path.exists(audio_prompt_path):
         try:
+            if not HAS_TORCHAUDIO:
+                raise RuntimeError("torchaudio unavailable for prompt preprocessing; skipping")
             prompt_audio, prompt_sr = torchaudio.load(audio_prompt_path)
             # Convert to mono
             if prompt_audio.shape[0] > 1:
@@ -718,13 +867,18 @@ try:
             prompt_tmp.close()
             torchaudio.save(prompt_tmp_path, prompt_audio, prompt_sr)
             audio_prompt_path = prompt_tmp_path
-            print(f"Preprocessed voice prompt saved: {audio_prompt_path}")
+            print(f"Preprocessed voice prompt saved: {{audio_prompt_path}}")
+            
+            # Clean up prompt tensor
+            del prompt_audio
+            force_memory_cleanup()
+            
         except Exception as e:
-            print(f"Prompt preprocessing failed, using original prompt: {e}")
+            print("Prompt preprocessing failed, using original prompt: " + str(e))
     
     # Generate speech with parameters
     if audio_prompt_path != "None":
-        print(f"Using voice cloning with prompt: {audio_prompt_path}")
+        print(f"Using voice cloning with prompt: {{audio_prompt_path}}")
         with torch.inference_mode():
             wav = model.generate(
                 text, 
@@ -747,6 +901,11 @@ try:
     
     log_memory_usage("After generation")
     
+    # Check memory after generation
+    if not check_memory_limit():
+        print("ERROR: Memory usage too high after generation, aborting")
+        sys.exit(1)
+    
     # Ensure output directory exists
     output_dir = os.path.dirname(output_path)
     if output_dir:
@@ -756,18 +915,22 @@ try:
     # Optional resample to reduce memory/disk size
     TARGET_SR = {int(target_sr)}
     sr_to_use = model.sr
-    if TARGET_SR and TARGET_SR > 0 and TARGET_SR != model.sr:
+    if TARGET_SR and TARGET_SR > 0 and TARGET_SR != model.sr and HAS_TORCHAUDIO:
         print(f"Resampling from {{model.sr}} to {{TARGET_SR}}")
         try:
             wav = torchaudio.functional.resample(wav, model.sr, TARGET_SR)
             sr_to_use = TARGET_SR
         except Exception as e:
-            print(f"Resample failed, keeping original SR {{model.sr}}: {e}")
+            print("Resample failed, keeping original SR " + str(model.sr) + ": " + str(e))
             sr_to_use = model.sr
-    try:
-        torchaudio.save(output_path, wav, sr_to_use)
-    except Exception as e:
-        print(f"torchaudio.save failed, falling back to wave module: {e}")
+    if HAS_TORCHAUDIO:
+        try:
+            torchaudio.save(output_path, wav, sr_to_use)
+            print("Audio saved successfully with torchaudio")
+        except Exception as e:
+            print("torchaudio.save failed, falling back to wave module: " + str(e))
+            HAS_TORCHAUDIO = False
+    if not HAS_TORCHAUDIO:
         wav_np = wav.squeeze(0).detach().cpu().numpy()
         wav_np = np.clip(wav_np, -1.0, 1.0)
         wav_int16 = (wav_np * 32767.0).astype(np.int16)
@@ -776,12 +939,24 @@ try:
             wf.setsampwidth(2)
             wf.setframerate(int(sr_to_use))
             wf.writeframes(wav_int16.tobytes())
+        print("Audio saved successfully with wave module")
     
     log_memory_usage("After save")
     
+    # Check memory before cleanup
+    if not check_memory_limit():
+        print("ERROR: Memory usage too high before cleanup, aborting")
+        sys.exit(1)
+    
     # Clean up audio tensor but keep model for potential reuse
     del wav
-    gc.collect()
+    if 'wav_np' in locals():
+        del wav_np
+    if 'wav_int16' in locals():
+        del wav_int16
+    
+    # Aggressive cleanup after generation
+    force_memory_cleanup()
     
     log_memory_usage("After cleanup")
     
@@ -806,6 +981,8 @@ except Exception as e:
     traceback.print_exc()
     sys.exit(1)
 '''
+            # The script is already properly formatted, just wrap it under a top-level guard
+            tts_script = "if True:\n" + textwrap.indent(tts_script_raw, "    ")
             
             # Write script to temporary file
             with tempfile.NamedTemporaryFile(mode='w', suffix='.py', delete=False, encoding='utf-8') as script_file:
@@ -816,20 +993,24 @@ except Exception as e:
                 # Execute the TTS script with better error handling and monitoring
                 self.logger.info(f"Running Chatterbox TTS script for {len(text)} characters")
                 
-                # Use longer timeout for larger texts, but with reasonable limits
-                base_timeout = 300  # 5 minutes base
-                char_factor = len(text) / 1000  # Add 1 second per 1000 characters
-                timeout = min(base_timeout + char_factor, 900)  # Max 15 minutes
+                # Determine timeout for single-chunk generation
+                # Priority: environment override -> voice cloning default -> regular default
+                timeout_env = os.getenv('CHB_TTS_TIMEOUT_SECONDS')
+                if timeout_env and timeout_env.isdigit():
+                    timeout = int(timeout_env)
+                else:
+                    # Voice cloning typically needs more time even for short texts
+                    timeout = 1800 if (audio_prompt_path is not None) else 900
                 
-                self.logger.debug(f"Using timeout: {timeout} seconds for {len(text)} characters")
+                self.logger.info(f"Using single-chunk timeout: {timeout} seconds")
                 
                 result = await self._run_command([str(self.python_path), script_path], cwd=str(current_dir), timeout=int(timeout))
                 
                 # Log the full output for debugging
                 if result.stdout:
-                    self.logger.debug(f"TTS stdout: {result.stdout}")
+                    self.logger.info(f"TTS stdout: {result.stdout}")
                 if result.stderr:
-                    self.logger.debug(f"TTS stderr: {result.stderr}")
+                    self.logger.info(f"TTS stderr: {result.stderr}")
                 
                 if result.returncode == 0 and "CHATTERBOX_SUCCESS" in result.stdout:
                     # Check if output file was created
@@ -843,8 +1024,22 @@ except Exception as e:
                             "file_size": file_size
                         }
                     else:
-                        self.logger.error("Chatterbox TTS script succeeded but no audio file created")
-                        return {"success": False, "error": "No audio file generated"}
+                        self.logger.error("Chatterbox TTS script reported success but no audio file created")
+                        # Fall through to failure handling below
+
+                # If script did not report success, check if output file was still created
+                if os.path.exists(output_path) and os.path.getsize(output_path) > 0:
+                    file_size = os.path.getsize(output_path)
+                    self.logger.warning(
+                        f"Chatterbox TTS script returned code {result.returncode} but audio was created: {file_size} bytes. Accepting as success."
+                    )
+                    return {
+                        "success": True,
+                        "engine": "Chatterbox TTS",
+                        "output_path": output_path,
+                        "file_size": file_size
+                    }
+
                 else:
                     error_msg = result.stderr or result.stdout or "Unknown error"
                     
@@ -853,8 +1048,8 @@ except Exception as e:
                         error_msg = "Memory access violation - text may be too long or system resources insufficient"
                     elif "memory" in error_msg.lower() or "oom" in error_msg.lower():
                         error_msg = "Out of memory error - try reducing text length or freeing system memory"
-                    elif "cuda" in error_msg.lower():
-                        error_msg = "CUDA error - model will fallback to CPU processing"
+                    # Do not treat CUDA messages as fatal; they are often harmless on CPU-only systems
+                    # Leave error_msg unchanged for any CUDA mentions so we don't misclassify warnings as errors
                     
                     self.logger.error(f"Chatterbox TTS script failed (exit code {result.returncode}): {error_msg}")
                     return {"success": False, "error": f"Chatterbox TTS error: {error_msg}"}
@@ -870,9 +1065,15 @@ except Exception as e:
                 except:
                     pass
                 
-        except Exception as e:
-            self.logger.error(f"Error generating single chunk: {e}")
-            return {"success": False, "error": f"Single chunk generation failed: {str(e)}"}
+        except Exception as exc:
+            # Avoid scoping issues with exception variables on some Python versions
+            try:
+                import traceback
+                tb = traceback.format_exc()
+            except Exception:
+                tb = ""
+            self.logger.error(f"Error generating single chunk: {exc}\n{tb}")
+            return {"success": False, "error": f"Single chunk generation failed: {exc}"}
     
     async def _generate_single_chunk_frozen(
         self, 
@@ -885,6 +1086,13 @@ except Exception as e:
         """Generate speech for a single text chunk in frozen environment using cached model."""
         try:
             self.logger.info(f"Generating speech for single chunk in frozen environment: {len(text)} characters")
+            
+            # Check memory before processing in frozen mode
+            if not self._check_system_memory():
+                return {
+                    "success": False,
+                    "error": "Insufficient system memory for frozen TTS processing. Please close other applications and try again."
+                }
             
             import warnings
             import gc
@@ -993,6 +1201,13 @@ except Exception as e:
         try:
             self.logger.info(f"Generating speech for {len(text_chunks)} chunks with memory management")
             
+            # Check memory before processing multiple chunks
+            if not self._check_system_memory():
+                return {
+                    "success": False,
+                    "error": "Insufficient system memory for multi-chunk TTS processing. Please close other applications and try again."
+                }
+            
             # For very large books, log progress estimates
             if len(text_chunks) > 50:
                 self.logger.info(f"Large book processing: {len(text_chunks)} chunks detected")
@@ -1014,6 +1229,21 @@ except Exception as e:
             
             for i, chunk in enumerate(text_chunks):
                 self.logger.info(f"Processing chunk {i+1}/{len(text_chunks)}: {len(chunk)} characters")
+                
+                # Check memory before processing each chunk
+                if not self._check_system_memory():
+                    self.logger.error(f"Insufficient memory before processing chunk {i+1}")
+                    # Clean up temp files
+                    for temp_file in temp_audio_files:
+                        try:
+                            if os.path.exists(temp_file):
+                                os.remove(temp_file)
+                        except:
+                            pass
+                    return {
+                        "success": False,
+                        "error": f"Insufficient system memory while processing chunk {i+1}. Please close other applications and try again."
+                    }
                 
                 # Create temporary file for this chunk
                 temp_audio_file = os.path.join(output_dir, f"temp_chunk_{i:04d}.wav")
@@ -1097,8 +1327,8 @@ except Exception as e:
                 # Set working directory to backend-api to ensure chatterbox/src is in Python path
                 current_dir = Path(__file__).parent.parent
                 
-                # Create a script to combine audio files
-            combine_script = f'''
+            # Create a script to combine audio files
+            combine_script_raw = f'''
 import os
 import sys
 import torch
@@ -1155,14 +1385,25 @@ except Exception as e:
     traceback.print_exc()
     sys.exit(1)
 '''
+            combine_script_norm = "\n".join(line.lstrip() for line in textwrap.dedent(combine_script_raw).splitlines())
+            combine_script = "if True:\n" + textwrap.indent(combine_script_norm, "    ")
             
             # Write script to temporary file
             script_path = self.venv_path / "combine_audio.py"
             with open(script_path, 'w', encoding='utf-8') as f:
                 f.write(combine_script)
             
+            # Determine timeout for audio combination step
+            timeout_env = os.getenv('CHB_TTS_COMBINE_TIMEOUT_SECONDS') or os.getenv('CHB_TTS_TIMEOUT_SECONDS')
+            try:
+                timeout_seconds = int(timeout_env) if timeout_env else 600
+            except Exception:
+                timeout_seconds = 600
+
+            self.logger.info(f"Using combine timeout: {timeout_seconds} seconds")
+
             # Run the script
-            result = await self._run_command([str(self.python_path), str(script_path)], cwd=str(current_dir), timeout=300)
+            result = await self._run_command([str(self.python_path), str(script_path)], cwd=str(current_dir), timeout=timeout_seconds)
             
             # Clean up script
             try:

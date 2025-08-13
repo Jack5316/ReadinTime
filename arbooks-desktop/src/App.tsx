@@ -15,7 +15,7 @@ const App: FC<AppProps> = ({ children }) => {
     <div
       data-theme={settings.isFullScreen ? "paper" : settings.fontColour}
       style={{
-        fontFamily: `'${settings.fontStyle}', sans-serif`
+        fontFamily: `'Source Serif 4', serif`
       }}
     >
       {!location.pathname.startsWith("/book") && <Navbar />}

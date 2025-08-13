@@ -36,6 +36,7 @@ declare global {
   // Voice samples directory management
   getVoiceSamplesDirectory: () => Promise<Result<string>>;
   setVoiceSamplesDirectory: (directory: string) => Promise<Result<string>>;
+  listVoiceSamples: () => Promise<Result<VoiceSample[]>>;
     }
   }
 }

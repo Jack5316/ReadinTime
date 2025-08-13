@@ -1,6 +1,6 @@
 import React, { FC } from 'react';
 import useStore from '../../store/useStore';
-import { FONT_COLORS, FONT_STYLES } from '../../store/settings';
+import { FONT_COLORS } from '../../store/settings';
 
 interface FontSettingsProps {}
 
@@ -30,25 +30,7 @@ const FontSettings: FC<FontSettingsProps> = () => {
         </div>
       </div>
 
-      <div className="form-control">
-        <label className="label">
-          <span className="label-text">Font Style</span>
-        </label>
-        <select
-          className="select select-bordered w-full"
-          value={settings.fontStyle}
-          onChange={(e) =>
-            updateSettings({
-              ...settings,
-              fontStyle: e.target.value as typeof settings.fontStyle,
-            })
-          }
-        >
-          {FONT_STYLES.map((style) => (
-            <option key={style}>{style}</option>
-          ))}
-        </select>
-      </div>
+      {/* Font style selection removed: app uses a single default reading font */}
 
       <div className="form-control">
         <label className="label">

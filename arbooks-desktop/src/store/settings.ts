@@ -13,7 +13,7 @@ export const BG_COLORS = {
   lightYellow: '#fff9e6'
 };
 
-export const FONT_STYLES = ["Open-Dyslexic", "Lexend Deca", "Bookerly", "Arial", "Helvetica", "Tahoma"] as const;
+export const FONT_STYLES = ["Open-Dyslexic", "Source Serif 4", "Lexend Deca", "Arial", "Helvetica", "Tahoma"] as const;
 export const MODES = ["Speech and Images", "Text Only"] as const;
 
 export interface VoiceSample {

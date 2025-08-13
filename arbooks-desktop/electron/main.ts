@@ -46,21 +46,25 @@ async function isViteServerRunning(): Promise<boolean> {
   try {
     return new Promise((resolve) => {
       const req = http.get(`http://localhost:${VITE_PORT}`, {
-        timeout: 1000,
+        timeout: 3000, // Increased timeout
       }, (res) => {
+        console.log(`Vite server response: ${res.statusCode}`);
         resolve(res.statusCode === 200);
       });
       
-      req.on('error', () => {
+      req.on('error', (err) => {
+        console.log(`Vite server check error: ${err.message}`);
         resolve(false);
       });
       
       req.on('timeout', () => {
+        console.log('Vite server check timeout');
         req.destroy();
         resolve(false);
       });
     });
   } catch (error) {
+    console.log(`Vite server check exception: ${error}`);
     return false;
   }
 }
@@ -128,11 +132,20 @@ async function createWindow() {
       height: 600,
       backgroundColor: '#f8f4e6',
       useContentSize: true,
+      title: 'arBooks',
       webPreferences: {
         preload: path.join(__dirname, "preload.js"),
         nodeIntegration: false,
         contextIsolation: true,
+        webSecurity: true,
       },
+    });
+
+    // Keep a distinct, constant title so you can identify the Electron window
+    mainWindow.on('page-title-updated', (event) => {
+      event.preventDefault();
+      if (!mainWindow) return;
+      mainWindow.setTitle('arBooks');
     });
 
     mainWindow.webContents.on('before-input-event', (event, input) => {
@@ -177,20 +190,44 @@ async function createWindow() {
   })
 
     // Check if Vite dev server is running and load accordingly
-    const viteRunning = await isViteServerRunning();
+    let viteRunning = await isViteServerRunning();
+    console.log(`Vite server running check: ${viteRunning}`);
+    
+    // If Vite is not running, wait a bit and retry (useful for development)
+    if (!viteRunning && isDev) {
+      console.log("Vite not running, waiting 2 seconds and retrying...");
+      await new Promise(resolve => setTimeout(resolve, 2000));
+      viteRunning = await isViteServerRunning();
+      console.log(`Vite server running check after retry: ${viteRunning}`);
+    }
+    
     if (viteRunning) {
       const devUrl = `http://localhost:${VITE_PORT}`;
       console.log("Loading from Vite dev server:", devUrl);
       mainWindow.loadURL(devUrl);
     } else {
-      const indexPath = path.join(__dirname, 'index.html');
+      // Fallback to local index.html. Try dist-electron first (both __dirname and project root), then project root.
+      const fs = await import('fs/promises');
+      const exists = async (p: string) => !!(await fs.access(p).then(() => true).catch(() => false));
+      const distIndex = path.join(__dirname, 'index.html');
+      const projRoot = getAppRootDir();
+      const rendererDistIndex = path.join(projRoot, 'dist-electron', 'index.html');
+      const rootIndex = path.join(projRoot, 'index.html');
+      let indexPath = rootIndex;
+      if (await exists(distIndex)) {
+        indexPath = distIndex;
+      } else if (await exists(rendererDistIndex)) {
+        indexPath = rendererDistIndex;
+      }
       console.log("Loading from built files:", indexPath);
+      console.log("Available files in __dirname:", await fs.readdir(__dirname).catch(() => 'Error reading dir'));
+      console.log("Available files in root:", await fs.readdir(getAppRootDir()).catch(() => 'Error reading root dir'));
       mainWindow.loadFile(indexPath);
     }
     
-    // Open dev tools in development
+    // Open dev tools automatically in development to surface renderer errors
     if (isDev) {
-      mainWindow.webContents.openDevTools();
+      mainWindow.webContents.openDevTools({ mode: 'detach' });
     }
 
     mainWindow.setMenu(null);
@@ -628,25 +665,28 @@ app.whenReady().then(async () => {
       formData.append('description', description);
       formData.append('book_path', bookPath);
       
-      // Add voice cloning options if available
-      if (voiceCloning && voiceCloning.enabled) {
+      // Add voice cloning options if available (don't require 'enabled' when a valid source is present)
+      const hasSettingsSample = !!(voiceCloning && voiceCloning.mode === 'settings_sample' && voiceCloning.selectedSampleId);
+      const hasDirectUpload = !!(voiceCloning && voiceCloning.mode === 'direct_upload' && voiceCloning.voicePromptFile);
+      const shouldUseVoiceCloning = !!(voiceCloning && (voiceCloning.enabled || hasSettingsSample || hasDirectUpload));
+
+      if (shouldUseVoiceCloning) {
         console.log("[ELECTRON] Adding voice cloning options to request:", voiceCloning);
         formData.append('voice_cloning_enabled', 'true');
-        formData.append('voice_cloning_mode', voiceCloning.mode || 'none');
-        formData.append('exaggeration', voiceCloning.exaggeration?.toString() || '0.5');
-        formData.append('cfg_weight', voiceCloning.cfgWeight?.toString() || '0.5');
-        
-        if (voiceCloning.mode === 'settings_sample' && voiceCloning.selectedSampleId) {
-          formData.append('voice_sample_id', voiceCloning.selectedSampleId);
-        } else if (voiceCloning.mode === 'direct_upload' && voiceCloning.voicePromptFile) {
-          // Add the voice prompt file for direct upload
+        formData.append('voice_cloning_mode', voiceCloning?.mode || (hasSettingsSample ? 'settings_sample' : hasDirectUpload ? 'direct_upload' : 'none'));
+        formData.append('exaggeration', voiceCloning?.exaggeration?.toString() || '0.5');
+        formData.append('cfg_weight', voiceCloning?.cfgWeight?.toString() || '0.5');
+
+        if (hasSettingsSample) {
+          formData.append('voice_sample_id', voiceCloning!.selectedSampleId!);
+        } else if (hasDirectUpload) {
           let voiceFileBlob;
-          if (voiceCloning.voicePromptFile instanceof ArrayBuffer) {
-            voiceFileBlob = new Blob([voiceCloning.voicePromptFile], { type: 'audio/wav' });
-          } else if (voiceCloning.voicePromptFile instanceof File) {
-            voiceFileBlob = voiceCloning.voicePromptFile;
+          if (voiceCloning!.voicePromptFile instanceof ArrayBuffer) {
+            voiceFileBlob = new Blob([voiceCloning!.voicePromptFile], { type: 'audio/wav' });
+          } else if (voiceCloning!.voicePromptFile instanceof File) {
+            voiceFileBlob = voiceCloning!.voicePromptFile;
           } else {
-            voiceFileBlob = voiceCloning.voicePromptFile;
+            voiceFileBlob = voiceCloning!.voicePromptFile as any;
           }
           formData.append('voice_prompt_file', voiceFileBlob, 'voice_prompt.wav');
         }
@@ -839,19 +879,42 @@ app.whenReady().then(async () => {
         throw new Error(`Failed to get voice samples directory: ${response.statusText}`);
       }
 
-      const result = await response.json();
-      console.log("[ELECTRON] Voice samples directory:", result);
-      
-      // Extract directory string from response
-      const directory = result.directory || (typeof result === 'string' ? result : null);
+      const api = await response.json();
+      console.log("[ELECTRON] Voice samples directory API:", api);
+      // Unwrap common Result envelope shapes
+      const directory = api?.result?.directory || api?.directory || (typeof api === 'string' ? api : null);
       
       if (directory) {
-        return { success: true, result: directory };
+        return { success: true, result: { directory } };
       } else {
         throw new Error('Invalid directory format in API response');
       }
     } catch (error) {
       console.error("[ELECTRON] Error getting voice samples directory:", error);
+      return { success: false, error: error instanceof Error ? error.message : String(error) };
+    }
+  });
+
+  ipcMain.handle("list-voice-samples", async (event: any) => {
+    try {
+      console.log("[ELECTRON] Listing voice samples");
+
+      const response = await fetch(`${API_BASE_URL}/api/voice-samples`, {
+        method: 'GET',
+      });
+
+      if (!response.ok) {
+        const errorText = await response.text();
+        console.error("[ELECTRON] List voice samples error:", errorText);
+        throw new Error(`Failed to list voice samples: ${response.statusText}`);
+      }
+
+      const result = await response.json();
+      console.log("[ELECTRON] Voice samples list API:", result);
+      
+      return result;
+    } catch (error) {
+      console.error("[ELECTRON] Error listing voice samples:", error);
       return { success: false, error: error instanceof Error ? error.message : String(error) };
     }
   });
@@ -874,10 +937,11 @@ app.whenReady().then(async () => {
         throw new Error(`Failed to set voice samples directory: ${response.statusText}`);
       }
 
-      const result = await response.json();
-      console.log("[ELECTRON] Voice samples directory set:", result);
+      const api = await response.json();
+      console.log("[ELECTRON] Voice samples directory set API:", api);
+      const resolved = api?.result?.directory || api?.directory || directory;
       
-      return result;
+      return { success: true, result: { directory: resolved } };
     } catch (error) {
       console.error("[ELECTRON] Error setting voice samples directory:", error);
       return { success: false, error: error instanceof Error ? error.message : String(error) };

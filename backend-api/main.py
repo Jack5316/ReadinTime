@@ -101,23 +101,65 @@ except Exception as e:
 # Initialize logger
 logger = logging.getLogger(__name__)
 
-# Configurable voice samples directory
-def get_voice_samples_dir():
-    """Get the voice samples directory, creating it if it doesn't exist."""
-    # Try to get from environment variable first
+def _get_app_config_dir() -> str:
+    """Return per-user config dir (Roaming on Windows, ~/.arbooks elsewhere)."""
+    if sys.platform == "win32":
+        app_data = os.environ.get('APPDATA', os.path.expanduser('~'))
+        return os.path.join(app_data, 'arBooks')
+    return os.path.join(os.path.expanduser('~'), '.arbooks')
+
+
+def _get_config_file_path() -> str:
+    return os.path.join(_get_app_config_dir(), 'config.json')
+
+
+def _load_config() -> dict:
+    try:
+        cfg_path = _get_config_file_path()
+        if os.path.exists(cfg_path):
+            with open(cfg_path, 'r', encoding='utf-8') as f:
+                return json.load(f)
+    except Exception as e:
+        print(f"Warning: Failed to load config: {e}")
+    return {}
+
+
+def _save_config(cfg: dict) -> None:
+    try:
+        cfg_dir = _get_app_config_dir()
+        os.makedirs(cfg_dir, exist_ok=True)
+        cfg_path = _get_config_file_path()
+        with open(cfg_path, 'w', encoding='utf-8') as f:
+            json.dump(cfg, f, indent=2)
+    except Exception as e:
+        print(f"Warning: Failed to save config: {e}")
+
+
+# Configurable voice samples directory (env -> saved config -> default)
+def get_voice_samples_dir() -> str:
+    """Get the voice samples directory, creating it if it doesn't exist.
+
+    Priority:
+    1) ARBOOKS_VOICE_SAMPLES_DIR env var
+    2) Saved config in user's app config file
+    3) Platform default
+    """
     env_dir = os.environ.get('ARBOOKS_VOICE_SAMPLES_DIR')
     if env_dir:
         voice_samples_dir = env_dir
     else:
-        # Default to user's app data directory
-        if sys.platform == "win32":
-            app_data = os.environ.get('APPDATA', os.path.expanduser('~'))
-            voice_samples_dir = os.path.join(app_data, 'arBooks', 'voice_samples')
+        cfg = _load_config()
+        cfg_dir = cfg.get('voice_samples_dir')
+        if cfg_dir:
+            voice_samples_dir = cfg_dir
         else:
-            # Linux/Mac
-            voice_samples_dir = os.path.join(os.path.expanduser('~'), '.arbooks', 'voice_samples')
-    
-    # Create directory if it doesn't exist
+            # Default to user's app data directory
+            if sys.platform == "win32":
+                app_root = os.environ.get('APPDATA', os.path.expanduser('~'))
+                voice_samples_dir = os.path.join(app_root, 'arBooks', 'voice_samples')
+            else:
+                voice_samples_dir = os.path.join(os.path.expanduser('~'), '.arbooks', 'voice_samples')
+
     os.makedirs(voice_samples_dir, exist_ok=True)
     return voice_samples_dir
 
@@ -271,9 +313,15 @@ async def generate_voice_cloned_tts(
             if not filename.lower().endswith(('.wav', '.mp3', '.flac', '.ogg')):
                 return Result(success=False, error="Uploaded file must be an audio file (.wav, .mp3, .flac, .ogg)")
         
-        # Save uploaded audio prompt to temporary file
+        # Save uploaded audio prompt to temporary file, preserve original extension when possible
         tmp_dir = tempfile.gettempdir()
-        audio_prompt_path = os.path.join(tmp_dir, f"voice_prompt_{hash(text)}.wav")
+        original_name = (audio_prompt_file.filename or "voice_prompt").lower()
+        _, ext = os.path.splitext(original_name)
+        if ext not in [
+            ".wav", ".mp3", ".flac", ".ogg", ".m4a", ".aac", ".wma", ".webm", ".opus"
+        ]:
+            ext = ".wav"
+        audio_prompt_path = os.path.join(tmp_dir, f"voice_prompt_{hash(text)}{ext}")
         
         with open(audio_prompt_path, "wb") as f:
             content = await audio_prompt_file.read()
@@ -795,8 +843,9 @@ async def process_book_complete(
                             voice_cloning_opts["sample_path"] = matching_files[0]
                             logger.info(f"Using voice sample: {matching_files[0]}")
                         else:
-                            logger.error(f"Voice sample not found for ID: {voice_sample_id}")
-                            voice_cloning_opts = None
+                            error_msg = f"Voice sample not found for ID: {voice_sample_id} in {VOICE_SAMPLES_DIR}"
+                            logger.error(error_msg)
+                            return Result(success=False, error=error_msg)
 
                 result = await pipeline_manager.process_book(book_data, update_progress, voice_cloning_opts)
                 
@@ -845,13 +894,13 @@ async def process_book_complete(
         
         # Log the job creation for debugging
         logger.info(f"Created processing job {job_id} for '{title}' ({filename})")
-        
+
         return Result(success=True, result={
-            "job_id": job_id,
-            "message": f"Started processing '{title}' ({filename})",
-            "filename": filename,
-            "title": title
-        })
+                "job_id": job_id,
+                "message": f"Started processing '{title}' ({filename})",
+                "filename": filename,
+                "title": title
+            })
         
     except Exception as e:
         logger.error(f"Error starting book processing: {e}")
@@ -919,6 +968,121 @@ async def get_voice_samples_directory():
         logger.error(f"Error getting voice samples directory: {e}")
         return Result(success=False, error=str(e))
 
+@app.get("/ping")
+async def ping():
+    """Simple ping endpoint"""
+    return {"pong": True}
+
+@app.get("/health")
+async def health_check():
+    """Health check endpoint"""
+    try:
+        return {
+            "status": "healthy",
+            "timestamp": time.time(),
+            "voice_samples_dir": VOICE_SAMPLES_DIR,
+            "voice_samples_dir_exists": os.path.exists(VOICE_SAMPLES_DIR),
+            "voice_samples_dir_is_dir": os.path.isdir(VOICE_SAMPLES_DIR) if os.path.exists(VOICE_SAMPLES_DIR) else False,
+        }
+    except Exception as e:
+        logger.error(f"Health check failed: {e}")
+        return {"status": "unhealthy", "error": str(e)}
+
+@app.get("/api/voice-samples")
+async def list_voice_samples():
+    """List all available voice samples"""
+    try:
+        logger.info(f"Listing voice samples from directory: {VOICE_SAMPLES_DIR}")
+        
+        # Check if the directory exists and is accessible
+        if not os.path.exists(VOICE_SAMPLES_DIR):
+            logger.info(f"Voice samples directory does not exist: {VOICE_SAMPLES_DIR}")
+            return Result(success=True, result=[])
+        
+        if not os.path.isdir(VOICE_SAMPLES_DIR):
+            logger.warning(f"Voice samples path is not a directory: {VOICE_SAMPLES_DIR}")
+            return Result(success=True, result=[])
+        
+        try:
+            files = os.listdir(VOICE_SAMPLES_DIR)
+            logger.info(f"Found {len(files)} files in voice samples directory")
+        except PermissionError:
+            logger.error(f"Permission denied accessing voice samples directory: {VOICE_SAMPLES_DIR}")
+            return Result(success=False, error="Permission denied accessing voice samples directory")
+        except Exception as e:
+            logger.error(f"Error listing voice samples directory: {e}")
+            return Result(success=False, error=f"Error listing voice samples directory: {str(e)}")
+        
+        voice_samples = []
+        for filename in files:
+            if filename.endswith(('.wav', '.mp3', '.flac', '.ogg', '.m4a')):
+                file_path = os.path.join(VOICE_SAMPLES_DIR, filename)
+                try:
+                    # Extract sample_id and original filename from the stored filename
+                    # Format: {unique_sample_id}_{original_filename}
+                    # The unique_sample_id is like "sample_1755020669574" and contains the actual unique ID
+                    if filename.startswith('sample_'):
+                        # Handle the case where the filename format is "sample_timestamp_originalname.extension"
+                        # We need to find where the timestamp ends and the original name begins
+                        # The format is: sample_timestamp_originalname.extension
+                        parts = filename.split('_', 2)  # Split into max 3 parts
+                        if len(parts) >= 3:
+                            # parts[0] = "sample"
+                            # parts[1] = timestamp (e.g., "1755020669574")
+                            # parts[2] = original filename with extension
+                            unique_id = f"{parts[0]}_{parts[1]}"  # "sample_timestamp"
+                            original_filename = parts[2]
+                            name = original_filename.rsplit('.', 1)[0]  # Remove extension
+                            
+                            # Get file stats
+                            stat = os.stat(file_path)
+                            
+                            voice_samples.append({
+                                "id": unique_id,  # Use the full unique ID like "sample_1755020669574"
+                                "name": name,  # Use the actual name entered by user
+                                "fileName": filename,
+                                "filePath": file_path,
+                                "fileSize": stat.st_size,
+                                "uploadTime": stat.st_mtime
+                            })
+                            logger.debug(f"Processed voice sample: {unique_id} -> {name}")
+                        else:
+                            logger.warning(f"Skipping voice sample file with invalid format: {filename}")
+                    else:
+                        # Handle other formats if they exist
+                        parts = filename.split('_', 1)
+                        if len(parts) == 2:
+                            sample_id = parts[0]
+                            original_filename = parts[1]
+                            
+                            # Get file stats
+                            stat = os.stat(file_path)
+                            
+                            voice_samples.append({
+                                "id": sample_id,
+                                "name": original_filename.rsplit('.', 1)[0],  # Remove extension for display name
+                                "fileName": filename,
+                                "fileSize": stat.st_size,
+                                "filePath": file_path,
+                                "uploadTime": stat.st_mtime
+                            })
+                            logger.debug(f"Processed voice sample: {sample_id} -> {original_filename}")
+                        else:
+                            logger.warning(f"Skipping voice sample file with invalid format: {filename}")
+                except Exception as e:
+                    logger.warning(f"Error processing voice sample file {filename}: {e}")
+                    continue
+        
+        # Sort by upload time (newest first)
+        voice_samples.sort(key=lambda x: x.get("uploadTime", 0), reverse=True)
+        
+        logger.info(f"Successfully processed {len(voice_samples)} voice samples")
+        return Result(success=True, result=voice_samples)
+        
+    except Exception as e:
+        logger.error(f"Error listing voice samples: {e}")
+        return Result(success=False, error=str(e))
+
 @app.post("/api/voice-samples/directory")
 async def set_voice_samples_directory(directory: str = Form(...)):
     """Set the voice samples directory"""
@@ -942,10 +1106,16 @@ async def set_voice_samples_directory(directory: str = Form(...)):
         except Exception as e:
             return Result(success=False, error=f"Directory is not writable: {str(e)}")
         
-        # Update the global variable
+        # Update the global variable and persist to config
         VOICE_SAMPLES_DIR = directory
+        try:
+            cfg = _load_config()
+            cfg['voice_samples_dir'] = VOICE_SAMPLES_DIR
+            _save_config(cfg)
+        except Exception as e:
+            logger.warning(f"Failed to persist voice samples dir: {e}")
+
         logger.info(f"Voice samples directory changed to: {VOICE_SAMPLES_DIR}")
-        
         return Result(success=True, result={"directory": VOICE_SAMPLES_DIR})
     except Exception as e:
         logger.error(f"Error setting voice samples directory: {e}")
@@ -966,7 +1136,9 @@ async def upload_voice_sample(
             if not filename.lower().endswith(('.wav', '.mp3', '.flac', '.ogg', '.m4a')):
                 return Result(success=False, error="Uploaded file must be an audio file")
         
-        # Create safe filename
+        # Create safe filename with unique ID
+        # Use the sample_id (which should be unique like "sample_1755020669574")
+        # and append the original filename to preserve the extension
         safe_filename = f"{sample_id}_{file.filename}"
         file_path = os.path.join(VOICE_SAMPLES_DIR, safe_filename)
         
@@ -978,8 +1150,10 @@ async def upload_voice_sample(
         logger.info(f"Voice sample uploaded: {name} ({safe_filename})")
         
         return Result(success=True, result={
-            "filePath": file_path,
+            "id": sample_id,
+            "name": name,
             "fileName": safe_filename,
+            "filePath": file_path,
             "fileSize": len(content)
         })
         

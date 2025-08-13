@@ -113,8 +113,8 @@ const FlipBook = forwardRef<FlipBookHandle, FlipBookProps>(({ textMappings, fold
     letterSpacing: `${settings.wordSpacing}px`,
     color: FONT_COLORS[settings.fontColour as keyof typeof FONT_COLORS],
     backgroundColor: BG_COLORS[settings.bgColour as keyof typeof BG_COLORS],
-    fontFamily: settings.fontStyle
-  }), [settings.fontSize, settings.lineSpacing, settings.wordSpacing, settings.fontColour, settings.bgColour, settings.fontStyle]);
+    fontFamily: 'Source Serif 4, serif'
+  }), [settings.fontSize, settings.lineSpacing, settings.wordSpacing, settings.fontColour, settings.bgColour]);
 
   // Track viewport for responsive centering and width
   useEffect(() => {
@@ -290,8 +290,8 @@ const FlipBook = forwardRef<FlipBookHandle, FlipBookProps>(({ textMappings, fold
     root.style.setProperty('--font-size', `${settings.fontSize}px`);
     root.style.setProperty('--line-height', `${settings.lineSpacing}`);
     root.style.setProperty('--letter-spacing', `${settings.wordSpacing}px`);
-    root.style.setProperty('--font-family', settings.fontStyle);
-  }, [settings.fontSize, settings.lineSpacing, settings.wordSpacing, settings.fontStyle]);
+    root.style.setProperty('--font-family', 'Source Serif 4, serif');
+  }, [settings.fontSize, settings.lineSpacing, settings.wordSpacing]);
 
   // Load saved preferences (optimized)
   useEffect(() => {
