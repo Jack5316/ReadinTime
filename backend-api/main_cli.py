@@ -11,7 +11,12 @@ def load_tts_from_config(device: str, config_path: Path):
     ch_src = repo_root / "chatterbox" / "src"
     if str(ch_src) not in sys.path:
         sys.path.insert(0, str(ch_src))
-    from chatterbox.chatterbox.tts import ChatterboxTTS
+    try:
+        # Correct path when chatterbox/src is on sys.path
+        from chatterbox.tts import ChatterboxTTS
+    except Exception:
+        # Fallback to package-style path if environment differs
+        from chatterbox.chatterbox.tts import ChatterboxTTS  # type: ignore
 
     if config_path.exists():
         with open(config_path, "r", encoding="utf-8") as f:
