@@ -35,6 +35,7 @@ devLog("PLATFORM:", process.platform);
 const VITE_PORT = 5173;
 const API_PORT = 8000;
 const API_BASE_URL = `http://127.0.0.1:${API_PORT}`;
+const NO_LOCALHOST = process.env.NO_LOCALHOST === '1' || process.env.SKIP_BACKEND === 'true' || process.env.LOCAL_TTS === '1';
 
 let mainWindow: BrowserWindow | null = null;
 let apiServerProcess: ChildProcess | null = null;
@@ -244,6 +245,10 @@ async function createWindow() {
 
 async function startApiServer() {
   try {
+    if (NO_LOCALHOST) {
+      console.log("[Backend] Disabled (NO_LOCALHOST)");
+      return;
+    }
     // Skip backend startup if environment variable is set
     if (process.env.SKIP_BACKEND === 'true') {
       console.log("Skipping backend startup due to SKIP_BACKEND environment variable");
@@ -511,11 +516,28 @@ app.whenReady().then(async () => {
 
   ipcMain.handle("list-books", async (event: any, directoryPath: string) => {
     try {
-      const formData = new FormData();
-      formData.append('directory_path', directoryPath);
-
-      const result = await apiFormRequest('/api/books/list', formData);
-      return result;
+      if (NO_LOCALHOST) {
+        const fs = await import('fs/promises');
+        const pathMod = await import('path');
+        const entries = await fs.readdir(directoryPath, { withFileTypes: true });
+        const books: any[] = [];
+        for (const e of entries) {
+          if (!e.isDirectory()) continue;
+          const folder = pathMod.join(directoryPath, e.name);
+          const infoPath = pathMod.join(folder, 'info.json');
+          try {
+            const buf = await fs.readFile(infoPath, { encoding: 'utf-8' });
+            const info = JSON.parse(buf);
+            books.push(info);
+          } catch {}
+        }
+        return { success: true, result: books };
+      } else {
+        const formData = new FormData();
+        formData.append('directory_path', directoryPath);
+        const result = await apiFormRequest('/api/books/list', formData);
+        return result;
+      }
     } catch (error) {
       console.error("Error listing books:", error);
       return { success: false, error: error instanceof Error ? error.message : String(error) };
@@ -524,11 +546,25 @@ app.whenReady().then(async () => {
 
   ipcMain.handle("read-book", async (event: any, bookPath: string) => {
     try {
-      const formData = new FormData();
-      formData.append('book_path', bookPath);
-
-      const result = await apiFormRequest('/api/books/read', formData);
-      return result;
+      if (NO_LOCALHOST) {
+        const fs = await import('fs/promises');
+        const pathMod = await import('path');
+        const mapPath = pathMod.join(bookPath, 'text_mappings.json');
+        const buf = await fs.readFile(mapPath, { encoding: 'utf-8' });
+        const textMappings = JSON.parse(buf);
+        const audioDir = pathMod.join(bookPath, 'audio');
+        const vc = pathMod.join(audioDir, 'voice_cloned_output.wav');
+        const reg = pathMod.join(audioDir, 'output.wav');
+        let audioFile: string | null = null;
+        try { await fs.access(vc); audioFile = 'voice_cloned_output.wav'; } catch {}
+        if (!audioFile) { try { await fs.access(reg); audioFile = 'output.wav'; } catch {} }
+        return { success: true, result: { textMappings, audioFile } };
+      } else {
+        const formData = new FormData();
+        formData.append('book_path', bookPath);
+        const result = await apiFormRequest('/api/books/read', formData);
+        return result;
+      }
     } catch (error) {
       console.error("Error reading book:", error);
       return { success: false, error: error instanceof Error ? error.message : String(error) };
@@ -537,6 +573,15 @@ app.whenReady().then(async () => {
 
   ipcMain.handle("get-file-data", async (event: any, filePath: string) => {
     try {
+      // Local fast-path: if backend is skipped or LOCAL_TTS is enabled, read file directly
+      if (process.env.SKIP_BACKEND === 'true' || process.env.LOCAL_TTS === '1') {
+        if (!filePath || filePath.trim() === '') {
+          return { success: false, error: 'File path is empty' };
+        }
+        const fs = await import('fs/promises');
+        const data = await fs.readFile(filePath);
+        return { success: true, result: Buffer.from(data) };
+      }
       if (!filePath || filePath.trim() === '') {
         console.log("Skipping empty file path request");
         return { success: false, error: "File path is empty" };
@@ -566,14 +611,36 @@ app.whenReady().then(async () => {
 
   ipcMain.handle("validate-system", async () => {
     try {
-      const response = await fetch(`${API_BASE_URL}/api/books/validate-system`);
-      
-      if (!response.ok) {
-        throw new Error(`System validation failed: ${response.statusText}`);
+      if (NO_LOCALHOST) {
+        const fs = await import('fs/promises');
+        const pathMod = await import('path');
+        const backendPath = getAppRootDir() ? pathMod.join(getAppRootDir(), "..", "backend-api") : pathMod.join(process.resourcesPath, "backend-api");
+        const checks: any = { offline: true };
+        // Compiled CLI
+        const compiled = process.platform === 'win32'
+          ? pathMod.join(backendPath, 'dist-cli', 'chatterbox_tts_cli.exe')
+          : pathMod.join(backendPath, 'dist-cli', 'chatterbox_tts_cli');
+        try { await fs.access(compiled); checks.compiledCli = compiled; } catch { checks.compiledCli = null; }
+        // Python fallback
+        const pythonPath = process.platform === 'win32'
+          ? pathMod.join(backendPath, 'venv-unified', 'Scripts', 'python.exe')
+          : pathMod.join(backendPath, 'venv-unified', 'bin', 'python');
+        try { await fs.access(pythonPath); checks.python = pythonPath; } catch { checks.python = null; }
+        // Model config and directory
+        const modelCfg = pathMod.join(backendPath, 'model-config.json');
+        const modelsDir = pathMod.join(backendPath, 'chatterbox_models');
+        try { await fs.access(modelCfg); checks.modelConfig = modelCfg; } catch { checks.modelConfig = null; }
+        try { await fs.access(modelsDir); checks.modelsDir = modelsDir; } catch { checks.modelsDir = null; }
+        const ok = !!(checks.compiledCli || checks.python) && !!checks.modelConfig;
+        return { success: ok, result: checks, error: ok ? null : 'Missing CLI/Python or model-config.json' };
+      } else {
+        const response = await fetch(`${API_BASE_URL}/api/books/validate-system`);
+        if (!response.ok) {
+          throw new Error(`System validation failed: ${response.statusText}`);
+        }
+        const result = await response.json();
+        return result;
       }
-
-      const result = await response.json();
-      return result; // Return the full Result object from the API
     } catch (error) {
       console.error("Error validating system:", error);
       return { success: false, error: error instanceof Error ? error.message : String(error) };
@@ -736,32 +803,66 @@ app.whenReady().then(async () => {
         throw new Error("Missing required parameters: text and voicePromptFile are required");
       }
 
+      // Local TTS path (no localhost): spawn CLI
+      if (process.env.LOCAL_TTS === '1' || process.env.SKIP_BACKEND === 'true') {
+        const tmp = await import('os');
+        const fs = await import('fs/promises');
+        const p = await import('path');
+
+        const promptPath = p.join(tmp.tmpdir(), `voice_prompt_${Date.now()}.wav`);
+        await fs.writeFile(promptPath, Buffer.from(new Uint8Array(voicePromptFile)));
+
+        const outPath = p.join(tmp.tmpdir(), `voice_cloned_tts_${Date.now()}.wav`);
+
+        const backendPath = getAppRootDir() ? p.join(getAppRootDir(), "..", "backend-api") : p.join(process.resourcesPath, "backend-api");
+        // Prefer compiled CLI if available
+        const compiledCli = process.platform === "win32"
+          ? p.join(backendPath, "dist-cli", "chatterbox_tts_cli.exe")
+          : p.join(backendPath, "dist-cli", "chatterbox_tts_cli");
+
+        let child;
+        if (await (async () => { try { const fs2 = await import('fs/promises'); await fs2.access(compiledCli); return true; } catch { return false; } })()) {
+          const args = ["--text", text, "--prompt", promptPath, "--out", outPath, "--exaggeration", String(exaggeration ?? 0.5), "--cfg-weight", String(cfgWeight ?? 0.5)];
+          child = spawn(compiledCli, args, { cwd: backendPath, stdio: ['ignore', 'pipe', 'pipe'] });
+        } else {
+          const pythonPath = process.platform === "win32"
+            ? p.join(backendPath, "venv-unified", "Scripts", "python.exe")
+            : p.join(backendPath, "venv-unified", "bin", "python");
+          const cliPath = p.join(backendPath, "main_cli.py");
+          const args = [cliPath, "--text", text, "--prompt", promptPath, "--out", outPath, "--exaggeration", String(exaggeration ?? 0.5), "--cfg-weight", String(cfgWeight ?? 0.5)];
+          child = spawn(pythonPath, args, { cwd: backendPath, stdio: ['ignore', 'pipe', 'pipe'] });
+        }
+
+        const waitExit = () => new Promise<string>((resolve, reject) => {
+          let stdout = Buffer.alloc(0);
+          let stderr = Buffer.alloc(0);
+          child.stdout?.on('data', (d) => { stdout = Buffer.concat([stdout, d]); });
+          child.stderr?.on('data', (d) => { stderr = Buffer.concat([stderr, d]); });
+          child.on('close', (code) => {
+            if (code === 0) resolve(stdout.toString().trim() || outPath);
+            else reject(new Error(`CLI exited ${code}: ${stderr.toString()}`));
+          });
+        });
+
+        const resolvedOut = await waitExit();
+        return { success: true, result: { audioPath: resolvedOut } };
+      }
+
+      // Fallback to backend API
       const formData = new FormData();
-      
-      // Convert ArrayBuffer to Blob for the audio file
       const audioBlob = new Blob([voicePromptFile], { type: 'audio/wav' });
-      
       formData.append('text', text);
       formData.append('audio_prompt_file', audioBlob, 'voice_prompt.wav');
       formData.append('exaggeration', (exaggeration ?? 0.5).toString());
       formData.append('cfg_weight', (cfgWeight ?? 0.5).toString());
 
-      console.log("[ELECTRON] Sending voice cloning request to API...");
-
-      const response = await fetch(`${API_BASE_URL}/api/tts/voice-clone`, {
-        method: 'POST',
-        body: formData,
-      });
-
+      const response = await fetch(`${API_BASE_URL}/api/tts/voice-clone`, { method: 'POST', body: formData });
       if (!response.ok) {
         const errorText = await response.text();
         console.error("[ELECTRON] Voice cloning API Error Response:", errorText);
         throw new Error(`Voice cloning failed: ${response.statusText}`);
       }
-
       const result = await response.json();
-      console.log("[ELECTRON] Voice cloning API response:", result);
-      
       return result;
     } catch (error) {
       console.error("[ELECTRON] Error generating voice cloned speech:", error);
@@ -776,53 +877,76 @@ app.whenReady().then(async () => {
       console.log("[ELECTRON] Book data:", bookData);
       console.log("[ELECTRON] Voice cloning options:", voiceCloningOptions);
 
+      if (NO_LOCALHOST) {
+        const pathMod = await import('path');
+        const fs = await import('fs/promises');
+        const tmp = await import('os');
+
+        // Determine prompt file if voice cloning is enabled
+        let promptPath: string | undefined = undefined;
+        if (voiceCloningOptions?.enabled && voiceCloningOptions.selectedSampleId) {
+          // Look up sample in userData/voice-samples
+          const dir = pathMod.join(app.getPath('userData'), 'voice-samples');
+          const entries = await fs.readdir(dir, { withFileTypes: true }).catch(() => [] as any);
+          for (const e of entries) {
+            if (!e.isFile()) continue;
+            const base = pathMod.parse(e.name).name;
+            if (base === voiceCloningOptions.selectedSampleId || e.name.startsWith(`${voiceCloningOptions.selectedSampleId}_`)) {
+              promptPath = pathMod.join(dir, e.name);
+              break;
+            }
+          }
+        }
+
+        // Use main_cli once to generate voice-cloned WAV for the whole markdown if needed.
+        // For now, we follow the previous behavior: generate a single output at book folder.
+        const audioDir = pathMod.join(bookData.bookPath, pathMod.parse(bookData.title).name, 'audio');
+        await fs.mkdir(audioDir, { recursive: true });
+        const outPath = pathMod.join(audioDir, voiceCloningOptions?.enabled ? 'voice_cloned_output.wav' : 'output.wav');
+
+        // Assemble command
+        const backendPath = pathMod.join(getAppRootDir(), "..", "backend-api");
+        const compiledCli = process.platform === 'win32'
+          ? pathMod.join(backendPath, 'dist-cli', 'chatterbox_tts_cli.exe')
+          : pathMod.join(backendPath, 'dist-cli', 'chatterbox_tts_cli');
+
+        const runCli = async (text: string, prompt?: string) => {
+          const args = ["--text", text, "--out", outPath];
+          if (prompt) { args.push("--prompt", prompt); }
+          if (voiceCloningOptions) {
+            args.push("--exaggeration", String(voiceCloningOptions.exaggeration ?? 0.5));
+            args.push("--cfg-weight", String(voiceCloningOptions.cfgWeight ?? 0.5));
+          }
+          return await new Promise<void>((resolve, reject) => {
+            const child = spawn(compiledCli, args, { cwd: backendPath, stdio: ['ignore', 'pipe', 'pipe'] });
+            let stderr = Buffer.alloc(0);
+            child.stderr?.on('data', d => { stderr = Buffer.concat([stderr, d]); });
+            child.on('close', code => {
+              if (code === 0) resolve(); else reject(new Error(`CLI exited ${code}: ${stderr.toString()}`));
+            });
+          });
+        };
+
+        // Load markdown text
+        const outputDir = pathMod.join(bookData.bookPath, pathMod.parse(bookData.title).name);
+        const mdPath = pathMod.join(outputDir, 'pdf_result.md');
+        const mdText = await fs.readFile(mdPath, { encoding: 'utf-8' });
+
+        await runCli(mdText, promptPath);
+        return { success: true, result: { audioPath: outPath } };
+      }
+
+      // Fallback to existing backend API
       const formData = new FormData();
       formData.append('filename', bookData.name);
       formData.append('book_path', bookData.bookPath);
-
       let endpoint = '/api/books/generate-tts';
-      
-      // Check if voice cloning should be used
       if (voiceCloningOptions?.enabled && voiceCloningOptions.selectedSampleId) {
-        console.log("[ELECTRON] Using voice cloning for TTS generation");
         endpoint = '/api/books/generate-voice-cloned-tts';
-        
-        // Get the voice sample file and add it to the form data
-        try {
-          const voiceSampleResponse = await fetch(`${API_BASE_URL}/api/voice-samples/${voiceCloningOptions.selectedSampleId}/file`);
-          if (voiceSampleResponse.ok) {
-            const voiceSampleBlob = await voiceSampleResponse.blob();
-            formData.append('voice_prompt_file', voiceSampleBlob, 'voice_prompt.wav');
-            formData.append('exaggeration', voiceCloningOptions.exaggeration.toString());
-            formData.append('cfg_weight', voiceCloningOptions.cfgWeight.toString());
-          } else {
-            console.warn("[ELECTRON] Failed to fetch voice sample, falling back to regular TTS");
-            endpoint = '/api/books/generate-tts';
-          }
-        } catch (error) {
-          console.warn("[ELECTRON] Error fetching voice sample, falling back to regular TTS:", error);
-          endpoint = '/api/books/generate-tts';
-        }
-      } else {
-        console.log("[ELECTRON] Using regular TTS generation");
       }
-
-      console.log("[ELECTRON] Sending TTS request to API endpoint:", endpoint);
-
-      const response = await fetch(`${API_BASE_URL}${endpoint}`, {
-        method: 'POST',
-        body: formData,
-      });
-
-      if (!response.ok) {
-        const errorText = await response.text();
-        console.error("[ELECTRON] TTS API Error Response:", errorText);
-        throw new Error(`TTS generation failed: ${response.statusText}`);
-      }
-
+      const response = await fetch(`${API_BASE_URL}${endpoint}`, { method: 'POST', body: formData });
+      if (!response.ok) { const errorText = await response.text(); throw new Error(`TTS failed: ${errorText}`); }
       const result = await response.json();
-      console.log("[ELECTRON] TTS API response:", result);
-      
       return result;
     } catch (error) {
       console.error("[ELECTRON] Error generating TTS:", error);
@@ -834,29 +958,28 @@ app.whenReady().then(async () => {
   ipcMain.handle("upload-voice-sample", async (event: any, file: ArrayBuffer, name: string, sampleId: string, fileName: string) => {
     try {
       console.log("[ELECTRON] Uploading voice sample:", name, fileName);
-
-      const formData = new FormData();
-      const fileBlob = new Blob([file], { type: 'audio/wav' });
-      
-      formData.append('file', fileBlob, fileName);
-      formData.append('name', name);
-      formData.append('sample_id', sampleId);
-
-      const response = await fetch(`${API_BASE_URL}/api/voice-samples/upload`, {
-        method: 'POST',
-        body: formData,
-      });
-
-      if (!response.ok) {
-        const errorText = await response.text();
-        console.error("[ELECTRON] Voice sample upload error:", errorText);
-        throw new Error(`Voice sample upload failed: ${response.statusText}`);
+      if (NO_LOCALHOST) {
+        const pathMod = await import('path');
+        const fs = await import('fs/promises');
+        const dir = pathMod.join(app.getPath('userData'), 'voice-samples');
+        await fs.mkdir(dir, { recursive: true });
+        // Preserve original extension
+        const ext = pathMod.extname(fileName) || '.wav';
+        const fname = `${sampleId}_${name.replace(/[^a-z0-9-_]/gi, '_')}${ext}`;
+        const full = pathMod.join(dir, fname);
+        await fs.writeFile(full, Buffer.from(new Uint8Array(file)));
+        return { success: true, result: { id: sampleId, name, fileName: fname, filePath: full } };
+      } else {
+        const formData = new FormData();
+        const fileBlob = new Blob([file], { type: 'audio/wav' });
+        formData.append('file', fileBlob, fileName);
+        formData.append('name', name);
+        formData.append('sample_id', sampleId);
+        const response = await fetch(`${API_BASE_URL}/api/voice-samples/upload`, { method: 'POST', body: formData });
+        if (!response.ok) { const errorText = await response.text(); throw new Error(`Upload failed: ${errorText}`); }
+        const result = await response.json();
+        return result;
       }
-
-      const result = await response.json();
-      console.log("[ELECTRON] Voice sample uploaded:", result);
-      
-      return result;
     } catch (error) {
       console.error("[ELECTRON] Error uploading voice sample:", error);
       return { success: false, error: error instanceof Error ? error.message : String(error) };
@@ -868,26 +991,19 @@ app.whenReady().then(async () => {
   ipcMain.handle("get-voice-samples-directory", async (event: any) => {
     try {
       console.log("[ELECTRON] Getting voice samples directory");
-
-      const response = await fetch(`${API_BASE_URL}/api/voice-samples/directory`, {
-        method: 'GET',
-      });
-
-      if (!response.ok) {
-        const errorText = await response.text();
-        console.error("[ELECTRON] Get voice samples directory error:", errorText);
-        throw new Error(`Failed to get voice samples directory: ${response.statusText}`);
-      }
-
-      const api = await response.json();
-      console.log("[ELECTRON] Voice samples directory API:", api);
-      // Unwrap common Result envelope shapes
-      const directory = api?.result?.directory || api?.directory || (typeof api === 'string' ? api : null);
-      
-      if (directory) {
-        return { success: true, result: { directory } };
+      if (NO_LOCALHOST) {
+        const pathMod = await import('path');
+        const fs = await import('fs/promises');
+        const defaultDir = pathMod.join(app.getPath('userData'), 'voice-samples');
+        await fs.mkdir(defaultDir, { recursive: true });
+        return { success: true, result: { directory: defaultDir } };
       } else {
-        throw new Error('Invalid directory format in API response');
+        const response = await fetch(`${API_BASE_URL}/api/voice-samples/directory`, { method: 'GET' });
+        if (!response.ok) throw new Error(`Failed: ${response.statusText}`);
+        const api = await response.json();
+        const directory = api?.result?.directory || api?.directory || (typeof api === 'string' ? api : null);
+        if (directory) return { success: true, result: { directory } };
+        throw new Error('Invalid directory format');
       }
     } catch (error) {
       console.error("[ELECTRON] Error getting voice samples directory:", error);
@@ -898,21 +1014,26 @@ app.whenReady().then(async () => {
   ipcMain.handle("list-voice-samples", async (event: any) => {
     try {
       console.log("[ELECTRON] Listing voice samples");
-
-      const response = await fetch(`${API_BASE_URL}/api/voice-samples`, {
-        method: 'GET',
-      });
-
-      if (!response.ok) {
-        const errorText = await response.text();
-        console.error("[ELECTRON] List voice samples error:", errorText);
-        throw new Error(`Failed to list voice samples: ${response.statusText}`);
+      if (NO_LOCALHOST) {
+        const pathMod = await import('path');
+        const fs = await import('fs/promises');
+        const dir = pathMod.join(app.getPath('userData'), 'voice-samples');
+        await fs.mkdir(dir, { recursive: true });
+        const entries = await fs.readdir(dir, { withFileTypes: true });
+        const audioExt = new Set(['.wav', '.mp3', '.flac', '.ogg', '.m4a']);
+        const files = await Promise.all(entries.filter(e => e.isFile() && audioExt.has(pathMod.extname(e.name).toLowerCase())).map(async e => {
+          const full = pathMod.join(dir, e.name);
+          const stat = await fs.stat(full);
+          const id = pathMod.parse(e.name).name; // base name
+          return { id, name: id, fileName: e.name, filePath: full, fileSize: stat.size };
+        }));
+        return { success: true, result: files };
+      } else {
+        const response = await fetch(`${API_BASE_URL}/api/voice-samples`, { method: 'GET' });
+        if (!response.ok) throw new Error(`Failed: ${response.statusText}`);
+        const result = await response.json();
+        return result;
       }
-
-      const result = await response.json();
-      console.log("[ELECTRON] Voice samples list API:", result);
-      
-      return result;
     } catch (error) {
       console.error("[ELECTRON] Error listing voice samples:", error);
       return { success: false, error: error instanceof Error ? error.message : String(error) };
@@ -922,26 +1043,19 @@ app.whenReady().then(async () => {
   ipcMain.handle("set-voice-samples-directory", async (event: any, directory: string) => {
     try {
       console.log("[ELECTRON] Setting voice samples directory:", directory);
-
-      const formData = new FormData();
-      formData.append('directory', directory);
-
-      const response = await fetch(`${API_BASE_URL}/api/voice-samples/directory`, {
-        method: 'POST',
-        body: formData,
-      });
-
-      if (!response.ok) {
-        const errorText = await response.text();
-        console.error("[ELECTRON] Set voice samples directory error:", errorText);
-        throw new Error(`Failed to set voice samples directory: ${response.statusText}`);
+      if (NO_LOCALHOST) {
+        const fs = await import('fs/promises');
+        await fs.mkdir(directory, { recursive: true });
+        return { success: true, result: { directory } };
+      } else {
+        const formData = new FormData();
+        formData.append('directory', directory);
+        const response = await fetch(`${API_BASE_URL}/api/voice-samples/directory`, { method: 'POST', body: formData });
+        if (!response.ok) throw new Error(`Failed: ${response.statusText}`);
+        const api = await response.json();
+        const resolved = api?.result?.directory || api?.directory || directory;
+        return { success: true, result: { directory: resolved } };
       }
-
-      const api = await response.json();
-      console.log("[ELECTRON] Voice samples directory set API:", api);
-      const resolved = api?.result?.directory || api?.directory || directory;
-      
-      return { success: true, result: { directory: resolved } };
     } catch (error) {
       console.error("[ELECTRON] Error setting voice samples directory:", error);
       return { success: false, error: error instanceof Error ? error.message : String(error) };
@@ -951,21 +1065,26 @@ app.whenReady().then(async () => {
   ipcMain.handle("delete-voice-sample", async (event: any, sampleId: string) => {
     try {
       console.log("[ELECTRON] Deleting voice sample:", sampleId);
-
-      const response = await fetch(`${API_BASE_URL}/api/voice-samples/${sampleId}`, {
-        method: 'DELETE',
-      });
-
-      if (!response.ok) {
-        const errorText = await response.text();
-        console.error("[ELECTRON] Voice sample delete error:", errorText);
-        throw new Error(`Voice sample delete failed: ${response.statusText}`);
+      if (NO_LOCALHOST) {
+        const pathMod = await import('path');
+        const fs = await import('fs/promises');
+        const dir = pathMod.join(app.getPath('userData'), 'voice-samples');
+        const entries = await fs.readdir(dir, { withFileTypes: true });
+        for (const e of entries) {
+          if (!e.isFile()) continue;
+          const name = pathMod.parse(e.name).name;
+          if (name === sampleId || e.name.startsWith(`${sampleId}_`)) {
+            await fs.unlink(pathMod.join(dir, e.name));
+            return { success: true, result: `Voice sample ${sampleId} deleted` };
+          }
+        }
+        return { success: false, error: `Voice sample ${sampleId} not found` };
+      } else {
+        const response = await fetch(`${API_BASE_URL}/api/voice-samples/${sampleId}`, { method: 'DELETE' });
+        if (!response.ok) throw new Error(`Failed: ${response.statusText}`);
+        const result = await response.json();
+        return result;
       }
-
-      const result = await response.json();
-      console.log("[ELECTRON] Voice sample deleted:", result);
-      
-      return result;
     } catch (error) {
       console.error("[ELECTRON] Error deleting voice sample:", error);
       return { success: false, error: error instanceof Error ? error.message : String(error) };
@@ -974,9 +1093,24 @@ app.whenReady().then(async () => {
 
   ipcMain.handle("get-voice-sample-url", async (event: any, sampleId: string) => {
     try {
-      // Return URL for voice sample file access
-      const url = `${API_BASE_URL}/api/voice-samples/${sampleId}/file`;
-      return { success: true, result: url };
+      if (NO_LOCALHOST) {
+        const pathMod = await import('path');
+        const fs = await import('fs/promises');
+        const dir = pathMod.join(app.getPath('userData'), 'voice-samples');
+        const entries = await fs.readdir(dir, { withFileTypes: true });
+        for (const e of entries) {
+          if (!e.isFile()) continue;
+          const name = pathMod.parse(e.name).name;
+          if (name === sampleId || e.name.startsWith(`${sampleId}_`)) {
+            const full = pathMod.join(dir, e.name);
+            return { success: true, result: full };
+          }
+        }
+        return { success: false, error: 'Not found' };
+      } else {
+        const url = `${API_BASE_URL}/api/voice-samples/${sampleId}/file`;
+        return { success: true, result: url };
+      }
     } catch (error) {
       console.error("[ELECTRON] Error getting voice sample URL:", error);
       return { success: false, error: error instanceof Error ? error.message : String(error) };

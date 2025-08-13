@@ -28,12 +28,10 @@ const VoiceCloningDemo: React.FC = () => {
     const result = await generateSpeech(text, voiceFile);
     
     if (result.success && result.result) {
-      // Create audio URL from the API server's file serving endpoint
-      // The result should contain the path to the generated audio file
+      // Use direct file path (offline mode). Backend URL only if needed.
       const resultData = result.result as any;
       const audioPath = resultData.audioPath || result.result;
-      const audioFileName = audioPath.split(/[\\/]/).pop(); // Get filename from path
-      setAudioUrl(`http://127.0.0.1:8000/api/files/data?file_path=${encodeURIComponent(audioPath)}`);
+      setAudioUrl(audioPath);
     }
   };
 

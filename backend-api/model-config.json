@@ -1,0 +1,9 @@
+{
+  "device": "cpu",
+  "source": "bundled",
+  "bundled_dir": "chatterbox_models",
+  "hf_repo": "ResembleAI/chatterbox",
+  "target_sr": 24000
+}
+
+
