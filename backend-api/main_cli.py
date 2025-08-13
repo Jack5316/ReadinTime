@@ -6,7 +6,12 @@ from pathlib import Path
 
 
 def load_tts_from_config(device: str, config_path: Path):
-    from chatterbox.src.chatterbox.tts import ChatterboxTTS
+    # Ensure local chatterbox/src is importable when running from repo
+    repo_root = Path(__file__).parent
+    ch_src = repo_root / "chatterbox" / "src"
+    if str(ch_src) not in sys.path:
+        sys.path.insert(0, str(ch_src))
+    from chatterbox.chatterbox.tts import ChatterboxTTS
 
     if config_path.exists():
         with open(config_path, "r", encoding="utf-8") as f:
