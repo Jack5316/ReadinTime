@@ -26,7 +26,14 @@ def load_tts_from_config(device: str, config_path: Path):
 
         if source == "bundled":
             bundled_dir = cfg.get("bundled_dir") or "chatterbox_models"
-            return ChatterboxTTS.from_local(bundled_dir, device)
+            # Verify required files exist; if not, fall back to HF
+            required = ["ve.safetensors", "t3_cfg.safetensors", "s3gen.safetensors", "tokenizer.json"]
+            have_all = all((Path(bundled_dir) / f).exists() for f in required)
+            if have_all:
+                return ChatterboxTTS.from_local(bundled_dir, device)
+            # fallback
+            print(f"Bundled models missing in {bundled_dir}; falling back to HuggingFace repo")
+            return ChatterboxTTS.from_pretrained(device)
         else:
             return ChatterboxTTS.from_pretrained(device)
 
