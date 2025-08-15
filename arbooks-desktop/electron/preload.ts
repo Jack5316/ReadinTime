@@ -18,15 +18,10 @@ const electronAPI = {
   getProcessingStatus: (jobId: string) => ipcRenderer.invoke("get-processing-status", jobId),
   validateSystem: () => ipcRenderer.invoke("validate-system"),
 
-  // uploading book pipeline (legacy individual steps)
-  uploadPDF: (bookData: BookUploadData) => ipcRenderer.invoke("upload-pdf", bookData),
-  convertPDFToMarkdown: (bookData: BookUploadData) => ipcRenderer.invoke("convert-pdf-to-markdown", bookData),
+  // TTS (offline-only)
   generateTTS: (bookData: BookUploadData, voiceCloningOptions?: { enabled: boolean; selectedSampleId: string | null; exaggeration: number; cfgWeight: number }) => ipcRenderer.invoke("generate-tts", bookData, voiceCloningOptions),
-  transcribeAudio: (bookData: BookUploadData) => ipcRenderer.invoke("transcribe-audio", bookData),
-  saveMetadata: (bookData: BookUploadData) => ipcRenderer.invoke("save-metadata", bookData),
 
-  // Voice cloning functions
-  generateVoiceClonedTTS: (bookData: BookUploadData, voicePromptFile: ArrayBuffer) => ipcRenderer.invoke("generate-voice-cloned-tts", bookData, voicePromptFile),
+  // Voice cloning functions (offline-only)
   generateVoiceClonedSpeech: (text: string, voicePromptFile: ArrayBuffer, exaggeration?: number, cfgWeight?: number) => ipcRenderer.invoke("generate-voice-cloned-speech", text, voicePromptFile, exaggeration, cfgWeight),
 
   // Voice sample management functions

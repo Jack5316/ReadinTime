@@ -70,6 +70,30 @@ export default defineConfig({
         if (existsSync('bin')) {
           copyDirectory('bin', 'dist-electron/bin');
         }
+
+        // Copy backend CLI and models for offline runtime if available
+        const backendDistCli = resolve('..', 'backend-api', 'dist-cli');
+        const backendModels = resolve('..', 'backend-api', 'chatterbox_models');
+        const backendCfg = resolve('..', 'backend-api', 'model-config.json');
+        const targetBackend = resolve('dist-electron', 'backend-api');
+
+        try {
+          // dist-cli binaries
+          if (existsSync(backendDistCli)) {
+            copyDirectory(backendDistCli, resolve(targetBackend, 'dist-cli'));
+          }
+          // bundled models (optional; keeps offline working without HF)
+          if (existsSync(backendModels)) {
+            copyDirectory(backendModels, resolve(targetBackend, 'chatterbox_models'));
+          }
+          // model-config.json
+          if (existsSync(backendCfg)) {
+            mkdirSync(targetBackend, { recursive: true });
+            copyFileSync(backendCfg, resolve(targetBackend, 'model-config.json'));
+          }
+        } catch (err) {
+          console.warn('[copy-assets] backend assets copy skipped:', err);
+        }
       },
     },
   ],
