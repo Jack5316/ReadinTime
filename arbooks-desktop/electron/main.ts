@@ -5,7 +5,7 @@ import dotenv from "dotenv";
 import { readFileSync } from "fs";
 import { BookInfo, BookUploadData } from "../src/types/book"
 import { Result } from "../src/types/result"
-import { spawn, ChildProcess } from "child_process";
+import { spawn } from "child_process";
 import http from 'http';
 
 dotenv.config();
@@ -33,14 +33,163 @@ devLog("ROOT DIR:", getAppRootDir());
 devLog("PLATFORM:", process.platform);
 
 const VITE_PORT = 5173;
-const API_PORT = 8000;
-const API_BASE_URL = `http://127.0.0.1:${API_PORT}`;
-const NO_LOCALHOST = process.env.NO_LOCALHOST === '1' || process.env.SKIP_BACKEND === 'true' || process.env.LOCAL_TTS === '1';
+// Offline-only mode: all operations run locally via IPC/CLI; no localhost HTTP
+
+// Voice samples directory state (persisted to userData)
+let voiceSamplesDir: string | null = null;
+function getDefaultVoiceSamplesDir() {
+  return path.join(app.getPath('userData'), 'voice-samples');
+}
+function getVoiceSamplesConfigPath() {
+  return path.join(app.getPath('userData'), 'voice-samples-config.json');
+}
+async function loadVoiceSamplesDirFromConfig(): Promise<string> {
+  const fs = await import('fs/promises');
+  try {
+    const cfgPath = getVoiceSamplesConfigPath();
+    const buf = await fs.readFile(cfgPath, { encoding: 'utf-8' });
+    const cfg = JSON.parse(buf || '{}');
+    const dir = typeof cfg.directory === 'string' && cfg.directory.trim() ? cfg.directory : getDefaultVoiceSamplesDir();
+    await fs.mkdir(dir, { recursive: true });
+    voiceSamplesDir = dir;
+    return dir;
+  } catch {
+    const dir = getDefaultVoiceSamplesDir();
+    try { await fs.mkdir(dir, { recursive: true }); } catch {}
+    voiceSamplesDir = dir;
+    return dir;
+  }
+}
+async function saveVoiceSamplesDirToConfig(dir: string): Promise<void> {
+  const fs = await import('fs/promises');
+  const cfgPath = getVoiceSamplesConfigPath();
+  const cfg = { directory: dir } as any;
+  await fs.mkdir(path.dirname(cfgPath), { recursive: true });
+  await fs.writeFile(cfgPath, JSON.stringify(cfg, null, 2), { encoding: 'utf-8' });
+}
 
 let mainWindow: BrowserWindow | null = null;
-let apiServerProcess: ChildProcess | null = null;
-let apiServerStarted = false;
 const isDev = process.env.NODE_ENV === 'development' || !app.isPackaged;
+
+// Offline job tracking (NO_LOCALHOST): mirror backend active_jobs for progress polling
+type JobStatus = {
+  stage: string;
+  progress: number;
+  message: string;
+  status: 'processing' | 'completed' | 'failed';
+  filename?: string;
+  title?: string;
+  files_created?: Record<string, boolean>;
+};
+const activeJobs: Record<string, JobStatus> = {};
+
+// Split text into manageable chunks for TTS (sentence-based, approx maxChars per chunk)
+function splitTextIntoChunks(text: string, maxChars: number = 300): string[] {
+  const sentences = text.split(/(?<=[.!?])\s+/);
+  const chunks: string[] = [];
+  let current = '';
+  for (const s of sentences) {
+    if ((current + (current ? ' ' : '') + s).length > maxChars && current) {
+      chunks.push(current.trim());
+      current = s;
+    } else {
+      current = current ? current + ' ' + s : s;
+    }
+  }
+  if (current.trim()) chunks.push(current.trim());
+  return chunks.length ? chunks : [text];
+}
+
+// Minimal WAV concatenation (PCM/IEEE float) assuming consistent format across inputs
+async function combineWavs(inputFiles: string[], outputFile: string): Promise<void> {
+  const fs = await import('fs/promises');
+
+  type WavInfo = {
+    format: number; // 1=PCM, 3=IEEE float
+    channels: number;
+    sampleRate: number;
+    bitsPerSample: number;
+    dataOffset: number;
+    dataLength: number;
+    buffer: Buffer;
+  };
+
+  function readUInt32LE(buf: Buffer, off: number) { return buf.readUInt32LE(off); }
+  function readUInt16LE(buf: Buffer, off: number) { return buf.readUInt16LE(off); }
+
+  function parseWav(buf: Buffer): WavInfo {
+    if (buf.toString('ascii', 0, 4) !== 'RIFF' || buf.toString('ascii', 8, 12) !== 'WAVE') {
+      throw new Error('Not a RIFF/WAVE file');
+    }
+    let pos = 12;
+    let fmtFound = false;
+    let dataFound = false;
+    let format = 1;
+    let channels = 1;
+    let sampleRate = 16000;
+    let bitsPerSample = 16;
+    let dataOffset = 0;
+    let dataLength = 0;
+    while (pos + 8 <= buf.length) {
+      const id = buf.toString('ascii', pos, pos + 4);
+      const size = readUInt32LE(buf, pos + 4);
+      const chunkStart = pos + 8;
+      if (id === 'fmt ') {
+        format = readUInt16LE(buf, chunkStart + 0);
+        channels = readUInt16LE(buf, chunkStart + 2);
+        sampleRate = readUInt32LE(buf, chunkStart + 4);
+        bitsPerSample = readUInt16LE(buf, chunkStart + 14);
+        fmtFound = true;
+      } else if (id === 'data') {
+        dataOffset = chunkStart;
+        dataLength = size;
+        dataFound = true;
+      }
+      pos = chunkStart + size + (size % 2); // pad to even
+    }
+    if (!fmtFound || !dataFound) throw new Error('Invalid WAV: missing fmt or data');
+    return { format, channels, sampleRate, bitsPerSample, dataOffset, dataLength, buffer: buf };
+  }
+
+  const infos: WavInfo[] = [];
+  for (const f of inputFiles) {
+    const buf = Buffer.from(await fs.readFile(f));
+    const info = parseWav(buf);
+    infos.push(info);
+  }
+
+  const first = infos[0];
+  for (const i of infos.slice(1)) {
+    if (i.format !== first.format || i.channels !== first.channels || i.sampleRate !== first.sampleRate || i.bitsPerSample !== first.bitsPerSample) {
+      throw new Error('WAV format mismatch between chunks');
+    }
+  }
+
+  const totalData = infos.reduce((acc, i) => acc + i.dataLength, 0);
+  const fmtChunkSize = 16; // PCM/IEEE float
+  const riffChunkSize = 4 + (8 + fmtChunkSize) + (8 + totalData); // 'WAVE' + fmt + data
+
+  const header = Buffer.alloc(12 + 8 + fmtChunkSize + 8);
+  header.write('RIFF', 0, 4, 'ascii');
+  header.writeUInt32LE(riffChunkSize, 4);
+  header.write('WAVE', 8, 4, 'ascii');
+  header.write('fmt ', 12, 4, 'ascii');
+  header.writeUInt32LE(fmtChunkSize, 16);
+  header.writeUInt16LE(first.format, 20); // audioFormat
+  header.writeUInt16LE(first.channels, 22); // numChannels
+  header.writeUInt32LE(first.sampleRate, 24); // sampleRate
+  const byteRate = first.sampleRate * first.channels * (first.bitsPerSample / 8);
+  header.writeUInt32LE(byteRate, 28);
+  const blockAlign = first.channels * (first.bitsPerSample / 8);
+  header.writeUInt16LE(blockAlign, 32);
+  header.writeUInt16LE(first.bitsPerSample, 34);
+  header.write('data', 36, 4, 'ascii');
+  header.writeUInt32LE(totalData, 40);
+
+  const pcmParts = infos.map(i => i.buffer.subarray(i.dataOffset, i.dataOffset + i.dataLength));
+  await fs.mkdir(path.dirname(outputFile), { recursive: true });
+  await fs.writeFile(outputFile, Buffer.concat([header, ...pcmParts]));
+}
 
 // Check if Vite dev server is running
 async function isViteServerRunning(): Promise<boolean> {
@@ -70,65 +219,7 @@ async function isViteServerRunning(): Promise<boolean> {
   }
 }
 
-// Check if a port is in use
-async function isPortInUse(port: number): Promise<boolean> {
-  const net = await import('net');
-  return new Promise((resolve) => {
-    const server = net.createServer();
-    server.listen(port, '127.0.0.1', () => {
-      server.once('close', () => resolve(false));
-      server.close();
-    });
-    server.on('error', (err: any) => {
-      if (err.code === 'EADDRINUSE') {
-        resolve(true);
-      } else {
-        resolve(false);
-      }
-    });
-  });
-}
-
-// Health check function
-async function checkApiServerHealth(silent: boolean = false): Promise<boolean> {
-  try {
-    if (NO_LOCALHOST) {
-      if (!silent) console.log('[Backend] Health check skipped (NO_LOCALHOST)');
-      return false;
-    }
-    // Skip health check if backend is disabled
-    if (process.env.SKIP_BACKEND === 'true') {
-      if (!silent) console.log('Skipping health check - backend disabled');
-      return false;
-    }
-
-    const endpoints = [
-      'http://127.0.0.1:8000/ping',
-      'http://127.0.0.1:8000/health',
-      'http://127.0.0.1:8000/'
-    ];
-
-    const tryEndpoint = (url: string) => new Promise<boolean>((resolve) => {
-      const req = http.get(url, { timeout: 3000, headers: { 'Accept': 'application/json' } }, (res) => {
-        const isOk = res.statusCode === 200;
-        if (!silent) console.log(`[Backend] Health check ${url}: ${isOk ? 'OK' : 'Failed'} (${res.statusCode})`);
-        resolve(isOk);
-      });
-      req.on('error', () => resolve(false));
-      req.on('timeout', () => { req.destroy(); resolve(false); });
-    });
-
-    for (const url of endpoints) {
-      if (await tryEndpoint(url)) return true;
-    }
-    return false;
-  } catch (error) {
-    if (!silent) {
-      console.log(`Health check exception: ${error}`);
-    }
-    return false;
-  }
-}
+// Removed localhost health/port checks – offline only
 
 async function createWindow() {
   try {
@@ -247,243 +338,20 @@ async function createWindow() {
   }
 }
 
-async function startApiServer() {
-  try {
-    if (NO_LOCALHOST) {
-      console.log("[Backend] Disabled (NO_LOCALHOST)");
-      return;
-    }
-    // Skip backend startup if environment variable is set
-    if (process.env.SKIP_BACKEND === 'true') {
-      console.log("Skipping backend startup due to SKIP_BACKEND environment variable");
-      return;
-    }
-    
-    if (apiServerStarted) {
-      console.log("API server startup already initiated, skipping...");
-      return;
-    }
-    
-    devLog("Attempting to start API server...");
-    
-    // First, try to check if an API server is already running and healthy
-    const isHealthy = await checkApiServerHealth(true);
-    if (isHealthy) {
-      console.log("[Backend] Using existing server (healthy)");
-      apiServerStarted = true;
-      return;
-    }
-    
-    const portInUse = await isPortInUse(API_PORT);
-    devLog(`Port ${API_PORT} in use check:`, portInUse);
-    if (portInUse) {
-      console.log("[Backend] Port in use; assuming server is running. Skipping start.");
-      apiServerStarted = true;
-      return;
-    }
-    
-    console.log("[Backend] Starting dev server...");
-    apiServerStarted = true;
-    
-    const backendPath = isDev
-      ? path.join(getAppRootDir(), "..", "backend-api")
-      : path.join(process.resourcesPath, "backend-api");
+// Removed backend server startup – offline only
 
-    // Prefer Python venv in development; compiled exe only in production or when forced
-    const fs = await import("fs/promises");
-    const exists = async (p: string) => !!(await fs.access(p).then(() => true).catch(() => false));
-
-    const preferPythonDev = isDev && process.env.FORCE_COMPILED_BACKEND !== 'true';
-
-    const mainScript = path.join(backendPath, "main.py");
-    const pythonPath = process.platform === "win32"
-      ? path.join(backendPath, "venv-unified", "Scripts", "python.exe")
-      : path.join(backendPath, "venv-unified", "bin", "python");
-
-    let resolvedPythonPath = pythonPath;
-    let resolvedMainScript = mainScript;
-
-    if (preferPythonDev) {
-      // Try dev python first
-      if (!(await exists(resolvedPythonPath)) || !(await exists(resolvedMainScript))) {
-        const devBackend = path.join(getAppRootDir(), "..", "backend-api");
-        const devPython = process.platform === "win32"
-          ? path.join(devBackend, "venv-unified", "Scripts", "python.exe")
-          : path.join(devBackend, "venv-unified", "bin", "python");
-        const devScript = path.join(devBackend, "main.py");
-        if (await exists(devPython) && await exists(devScript)) {
-          console.warn("Falling back to dev backend path", devBackend);
-          resolvedPythonPath = devPython;
-          resolvedMainScript = devScript;
-        }
-      }
-
-      if (await exists(resolvedPythonPath) && await exists(resolvedMainScript)) {
-        devLog("Using Python backend (dev mode):", resolvedPythonPath, resolvedMainScript);
-        apiServerProcess = spawn(resolvedPythonPath, [resolvedMainScript], {
-          cwd: path.dirname(resolvedMainScript),
-          stdio: ['ignore', 'pipe', 'pipe'],
-          env: { ...process.env, PYTHONUNBUFFERED: '1', LOG_LEVEL: process.env.BACKEND_LOG_LEVEL || 'WARNING' }
-        });
-      } else {
-        console.warn("Python backend not found; attempting to use compiled backend instead.");
-      }
-    }
-
-    if (!apiServerProcess) {
-      // Use compiled backend executable
-      let backendExecutableUnified: string;
-      let backendExecutableClassic: string;
-      if (process.platform === "win32") {
-        backendExecutableUnified = path.join(backendPath, "dist-unified", "arBooks_Backend_Unified.exe");
-        backendExecutableClassic = path.join(backendPath, "dist", "arBooks_Backend.exe");
-      } else {
-        backendExecutableUnified = path.join(backendPath, "dist-unified", "arBooks_Backend_Unified");
-        backendExecutableClassic = path.join(backendPath, "dist", "arBooks_Backend");
-      }
-
-      const backendExecutable = (await exists(backendExecutableUnified)) ? backendExecutableUnified : backendExecutableClassic;
-
-      if (await exists(backendExecutable)) {
-        devLog("Using compiled backend executable:", backendExecutable);
-        apiServerProcess = spawn(backendExecutable, [], {
-          cwd: backendPath,
-          stdio: ['ignore', 'pipe', 'pipe']
-        });
-      } else if (!preferPythonDev) {
-        // As a last resort, try python even in prod if compiled not found (dev unpacked run)
-        if (await exists(resolvedPythonPath) && await exists(resolvedMainScript)) {
-          devLog("Compiled backend not found, falling back to Python mode:", resolvedPythonPath);
-          apiServerProcess = spawn(resolvedPythonPath, [resolvedMainScript], {
-            cwd: path.dirname(resolvedMainScript),
-            stdio: ['ignore', 'pipe', 'pipe'],
-            env: { ...process.env, PYTHONUNBUFFERED: '1', LOG_LEVEL: process.env.BACKEND_LOG_LEVEL || 'WARNING' }
-          });
-        } else {
-          throw new Error(`Backend not found. Looked for compiled exe and Python at ${resolvedPythonPath}`);
-        }
-      }
-    }
-
-    const printLimited = (prefix: string, buf: Buffer) => {
-      const msg = buf.toString('utf8').trim();
-      if (!msg) return;
-      const lines = msg.split(/\r?\n/);
-      const head = lines.slice(0, 3).join('\n');
-      const extra = lines.length > 3 ? `\n... (${lines.length - 3} more)` : '';
-      console.log(`${prefix} ${head}${extra}`);
-    };
-    if (apiServerProcess) {
-      apiServerProcess.stdout?.on('data', (d) => printLimited('[Backend]', d as Buffer));
-      apiServerProcess.stderr?.on('data', (d) => printLimited('[Backend:ERR]', d as Buffer));
-      apiServerProcess.on('close', (code) => {
-        console.log(`API server exited with code ${code}`);
-        apiServerStarted = false;
-      });
-    }
-
-    // Wait for the server to actually start and become responsive
-    devLog("Waiting for API server to become responsive...");
-    let retries = 6; // Reduced from 10 to 6
-    let serverReady = false;
-    
-    while (retries > 0 && !serverReady) {
-      await new Promise(resolve => setTimeout(resolve, 2000)); // Increased from 1000ms to 2000ms
-      serverReady = await checkApiServerHealth(true);
-      if (!serverReady) {
-        retries--;
-        devLog(`API server not ready yet, ${retries} retries remaining...`);
-      }
-    }
-    
-    if (serverReady) {
-      console.log("[Backend] Ready");
-    } else {
-      console.log("[Backend] Started (not fully responsive yet)");
-      // Don't treat this as a failure - the server might still be initializing services
-    }
-
-  } catch (error) {
-    console.error("Error starting API server:", error);
-    apiServerStarted = false;
-  }
-}
-
-// API helper functions
-async function apiRequest(endpoint: string, options: RequestInit = {}): Promise<any> {
-  try {
-    if (NO_LOCALHOST) {
-      throw new Error('apiRequest not available in NO_LOCALHOST mode');
-    }
-    const response = await fetch(`${API_BASE_URL}${endpoint}`, {
-      headers: {
-        'Content-Type': 'application/json',
-        ...options.headers,
-      },
-      ...options,
-    });
-
-    if (!response.ok) {
-      throw new Error(`API request failed: ${response.status} ${response.statusText}`);
-    }
-
-    return await response.json();
-  } catch (error) {
-    console.error(`API request to ${endpoint} failed:`, error);
-    throw error;
-  }
-}
-
-async function apiFormRequest(endpoint: string, formData: FormData): Promise<any> {
-  try {
-    if (NO_LOCALHOST) {
-      throw new Error('apiFormRequest not available in NO_LOCALHOST mode');
-    }
-    const response = await fetch(`${API_BASE_URL}${endpoint}`, {
-      method: 'POST',
-      body: formData,
-    });
-
-    if (!response.ok) {
-      throw new Error(`API request failed: ${response.status} ${response.statusText}`);
-    }
-
-    return await response.json();
-  } catch (error) {
-    console.error(`API request to ${endpoint} failed:`, error);
-    throw error;
-  }
-}
+// Removed HTTP helpers – offline only
 
 app.whenReady().then(async () => {
-  // Start the backend API server
-  await startApiServer();
-
-  // Do not block the app on backend health in development; monitor in background
-  if (isDev && !NO_LOCALHOST) {
-    (async () => {
-      let retries = 15;
-      while (retries > 0) {
-        const ok = await checkApiServerHealth(true);
-        if (ok) { console.log('[Backend] Ready'); break; }
-        await new Promise(r => setTimeout(r, 2000));
-        retries -= 1;
-      }
-      if (retries === 0) console.warn('[Backend] Still not healthy after background retries; app will continue.');
-    })();
-  } else if (!NO_LOCALHOST) {
-    // In production, wait a bit and warn instead of quitting immediately
-    let healthy = await checkApiServerHealth();
-    let retries = 8;
-    while (!healthy && retries > 0) {
-      await new Promise(r => setTimeout(r, 2000));
-      healthy = await checkApiServerHealth();
-      retries -= 1;
-    }
-    if (!healthy) {
-      console.error('API server appears unavailable, continuing to load UI. Some features may not work until backend becomes ready.');
-    }
+  // Initialize voice samples directory from persisted config
+  try {
+    const dirInit = await loadVoiceSamplesDirFromConfig();
+    console.log('[ELECTRON] Voice samples directory:', dirInit);
+  } catch (e) {
+    console.warn('[ELECTRON] Failed to initialize voice samples directory:', e);
   }
+
+  // Removed backend startup/health checks – offline only
 
   ipcMain.handle('select-directory', async () => {
     try {
@@ -526,28 +394,21 @@ app.whenReady().then(async () => {
 
   ipcMain.handle("list-books", async (event: any, directoryPath: string) => {
     try {
-      if (NO_LOCALHOST) {
-        const fs = await import('fs/promises');
-        const pathMod = await import('path');
-        const entries = await fs.readdir(directoryPath, { withFileTypes: true });
-        const books: any[] = [];
-        for (const e of entries) {
-          if (!e.isDirectory()) continue;
-          const folder = pathMod.join(directoryPath, e.name);
-          const infoPath = pathMod.join(folder, 'info.json');
-          try {
-            const buf = await fs.readFile(infoPath, { encoding: 'utf-8' });
-            const info = JSON.parse(buf);
-            books.push(info);
-          } catch {}
-        }
-        return { success: true, result: books };
-      } else {
-        const formData = new FormData();
-        formData.append('directory_path', directoryPath);
-        const result = await apiFormRequest('/api/books/list', formData);
-        return result;
+      const fs = await import('fs/promises');
+      const pathMod = await import('path');
+      const entries = await fs.readdir(directoryPath, { withFileTypes: true });
+      const books: any[] = [];
+      for (const e of entries) {
+        if (!e.isDirectory()) continue;
+        const folder = pathMod.join(directoryPath, e.name);
+        const infoPath = pathMod.join(folder, 'info.json');
+        try {
+          const buf = await fs.readFile(infoPath, { encoding: 'utf-8' });
+          const info = JSON.parse(buf);
+          books.push(info);
+        } catch {}
       }
+      return { success: true, result: books };
     } catch (error) {
       console.error("Error listing books:", error);
       return { success: false, error: error instanceof Error ? error.message : String(error) };
@@ -556,25 +417,41 @@ app.whenReady().then(async () => {
 
   ipcMain.handle("read-book", async (event: any, bookPath: string) => {
     try {
-      if (NO_LOCALHOST) {
-        const fs = await import('fs/promises');
-        const pathMod = await import('path');
-        const mapPath = pathMod.join(bookPath, 'text_mappings.json');
+      const fs = await import('fs/promises');
+      const pathMod = await import('path');
+      const mapPath = pathMod.join(bookPath, 'text_mappings.json');
+      let textMappings: any[] = [];
+      try {
         const buf = await fs.readFile(mapPath, { encoding: 'utf-8' });
-        const textMappings = JSON.parse(buf);
-        const audioDir = pathMod.join(bookPath, 'audio');
-        const vc = pathMod.join(audioDir, 'voice_cloned_output.wav');
-        const reg = pathMod.join(audioDir, 'output.wav');
-        let audioFile: string | null = null;
-        try { await fs.access(vc); audioFile = 'voice_cloned_output.wav'; } catch {}
-        if (!audioFile) { try { await fs.access(reg); audioFile = 'output.wav'; } catch {} }
-        return { success: true, result: { textMappings, audioFile } };
-      } else {
-        const formData = new FormData();
-        formData.append('book_path', bookPath);
-        const result = await apiFormRequest('/api/books/read', formData);
-        return result;
+        textMappings = JSON.parse(buf);
+      } catch (e) {
+        // Fallback: build basic mappings from markdown if transcription not present
+        try {
+          const mdPath = pathMod.join(bookPath, 'pdf_result.md');
+          const md = await fs.readFile(mdPath, { encoding: 'utf-8' }).catch(() => '');
+          const rawText = md || '';
+          const sentences = rawText.split(/(?<=[.!?])\s+/).filter(Boolean);
+          let t = 0;
+          const approxPerSentence = 3; // seconds
+          textMappings = sentences.map((s) => {
+            const start = t;
+            const end = t + approxPerSentence;
+            t = end;
+            return { text: s, start, end };
+          });
+          console.warn('[ELECTRON] text_mappings.json missing; using basic sentence mapping fallback');
+        } catch (e2) {
+          console.error('[ELECTRON] Failed to create fallback text mappings:', e2);
+          textMappings = [];
+        }
       }
+      const audioDir = pathMod.join(bookPath, 'audio');
+      const vc = pathMod.join(audioDir, 'voice_cloned_output.wav');
+      const reg = pathMod.join(audioDir, 'output.wav');
+      let audioFile: string | null = null;
+      try { await fs.access(vc); audioFile = 'voice_cloned_output.wav'; } catch {}
+      if (!audioFile) { try { await fs.access(reg); audioFile = 'output.wav'; } catch {} }
+      return { success: true, result: { textMappings, audioFile } };
     } catch (error) {
       console.error("Error reading book:", error);
       return { success: false, error: error instanceof Error ? error.message : String(error) };
@@ -583,36 +460,13 @@ app.whenReady().then(async () => {
 
   ipcMain.handle("get-file-data", async (event: any, filePath: string) => {
     try {
-      // Local fast-path in offline mode
-      if (NO_LOCALHOST) {
-        if (!filePath || filePath.trim() === '') {
-          return { success: false, error: 'File path is empty' };
-        }
-        const fs = await import('fs/promises');
-        const data = await fs.readFile(filePath);
-        return { success: true, result: Buffer.from(data) };
-      }
       if (!filePath || filePath.trim() === '') {
         console.log("Skipping empty file path request");
         return { success: false, error: "File path is empty" };
       }
-
-      console.log(`Requesting file data for: ${filePath}`);
-      const encodedPath = encodeURIComponent(filePath);
-      const requestUrl = `${API_BASE_URL}/api/files/data?file_path=${encodedPath}`;
-      console.log(`Request URL: ${requestUrl}`);
-
-      const response = await fetch(requestUrl);
-      
-      if (!response.ok) {
-        const errorText = await response.text();
-        console.error(`API Error (${response.status}): ${errorText}`);
-        throw new Error(`Failed to get file data: ${response.statusText} - ${errorText}`);
-      }
-
-      const buffer = await response.arrayBuffer();
-      console.log(`Successfully loaded file data: ${buffer.byteLength} bytes`);
-      return { success: true, result: Buffer.from(buffer) };
+      const fs = await import('fs/promises');
+      const data = await fs.readFile(filePath);
+      return { success: true, result: Buffer.from(data) };
     } catch (error) {
       console.error("Error getting file data:", error);
       return { success: false, error: error instanceof Error ? error.message : String(error) };
@@ -621,36 +475,27 @@ app.whenReady().then(async () => {
 
   ipcMain.handle("validate-system", async () => {
     try {
-      if (NO_LOCALHOST) {
-        const fs = await import('fs/promises');
-        const pathMod = await import('path');
-        const backendPath = getAppRootDir() ? pathMod.join(getAppRootDir(), "..", "backend-api") : pathMod.join(process.resourcesPath, "backend-api");
-        const checks: any = { offline: true };
-        // Compiled CLI
-        const compiled = process.platform === 'win32'
-          ? pathMod.join(backendPath, 'dist-cli', 'chatterbox_tts_cli.exe')
-          : pathMod.join(backendPath, 'dist-cli', 'chatterbox_tts_cli');
-        try { await fs.access(compiled); checks.compiledCli = compiled; } catch { checks.compiledCli = null; }
-        // Python fallback
-        const pythonPath = process.platform === 'win32'
-          ? pathMod.join(backendPath, 'venv-unified', 'Scripts', 'python.exe')
-          : pathMod.join(backendPath, 'venv-unified', 'bin', 'python');
-        try { await fs.access(pythonPath); checks.python = pythonPath; } catch { checks.python = null; }
-        // Model config and directory
-        const modelCfg = pathMod.join(backendPath, 'model-config.json');
-        const modelsDir = pathMod.join(backendPath, 'chatterbox_models');
-        try { await fs.access(modelCfg); checks.modelConfig = modelCfg; } catch { checks.modelConfig = null; }
-        try { await fs.access(modelsDir); checks.modelsDir = modelsDir; } catch { checks.modelsDir = null; }
-        const ok = !!(checks.compiledCli || checks.python) && !!checks.modelConfig;
-        return { success: ok, result: checks, error: ok ? null : 'Missing CLI/Python or model-config.json' };
-      } else {
-        const response = await fetch(`${API_BASE_URL}/api/books/validate-system`);
-        if (!response.ok) {
-          throw new Error(`System validation failed: ${response.statusText}`);
-        }
-        const result = await response.json();
-        return result;
-      }
+      const fs = await import('fs/promises');
+      const pathMod = await import('path');
+      const backendPath = getAppRootDir() ? pathMod.join(getAppRootDir(), "..", "backend-api") : path.join(process.resourcesPath, "backend-api");
+      const checks: any = { offline: true };
+      // Compiled CLI
+      const compiled = process.platform === 'win32'
+        ? pathMod.join(backendPath, 'dist-cli', 'chatterbox_tts_cli.exe')
+        : pathMod.join(backendPath, 'dist-cli', 'chatterbox_tts_cli');
+      try { await fs.access(compiled); checks.compiledCli = compiled; } catch { checks.compiledCli = null; }
+      // Python fallback
+      const pythonPath = process.platform === 'win32'
+        ? pathMod.join(backendPath, 'venv-unified', 'Scripts', 'python.exe')
+        : pathMod.join(backendPath, 'venv-unified', 'bin', 'python');
+      try { await fs.access(pythonPath); checks.python = pythonPath; } catch { checks.python = null; }
+      // Model config and directory
+      const modelCfg = pathMod.join(backendPath, 'model-config.json');
+      const modelsDir = pathMod.join(backendPath, 'chatterbox_models');
+      try { await fs.access(modelCfg); checks.modelConfig = modelCfg; } catch { checks.modelConfig = null; }
+      try { await fs.access(modelsDir); checks.modelsDir = modelsDir; } catch { checks.modelsDir = null; }
+      const ok = !!(checks.compiledCli || checks.python) && !!checks.modelConfig;
+      return { success: ok, result: checks, error: ok ? null : 'Missing CLI/Python or model-config.json' };
     } catch (error) {
       console.error("Error validating system:", error);
       return { success: false, error: error instanceof Error ? error.message : String(error) };
@@ -659,20 +504,11 @@ app.whenReady().then(async () => {
 
   ipcMain.handle("get-processing-status", async (event: any, jobId: string) => {
     try {
-      console.log(`[ELECTRON] Getting processing status for job: ${jobId}`);
-      const url = `${API_BASE_URL}/api/books/processing-status/${jobId}`;
-      console.log(`[ELECTRON] Fetching from: ${url}`);
-      
-      const response = await fetch(url);
-      console.log(`[ELECTRON] Response status: ${response.status}`);
-      
-      if (!response.ok) {
-        throw new Error(`Failed to get processing status: ${response.statusText}`);
+      const status = activeJobs[jobId];
+      if (!status) {
+        return { success: false, error: 'Job not found' };
       }
-
-      const result = await response.json();
-      console.log(`[ELECTRON] Processing status result:`, result);
-      return result; // Return the full Result object from the API
+      return { success: true, result: status };
     } catch (error) {
       console.error("[ELECTRON] Error getting processing status:", error);
       return { success: false, error: error instanceof Error ? error.message : String(error) };
@@ -696,7 +532,7 @@ app.whenReady().then(async () => {
         throw new Error('Missing required fields for processing');
       }
 
-      if (NO_LOCALHOST) {
+      {
         const fs = await import('fs/promises');
         const pathMod = await import('path');
         const backendPath = pathMod.join(getAppRootDir(), "..", "backend-api");
@@ -704,103 +540,189 @@ app.whenReady().then(async () => {
         const outputDir = pathMod.join(bookPath, dirName);
         await fs.mkdir(pathMod.join(outputDir, 'audio'), { recursive: true });
 
-        // Save PDF
-        const pdfOut = pathMod.join(outputDir, fileName || 'input.pdf');
-        await fs.writeFile(pdfOut, Buffer.from(new Uint8Array(pdfData)));
+        // Create a job id and initialize status
+        const jobId = `${(fileName || 'book')}_${Date.now()}`;
+        activeJobs[jobId] = {
+          stage: 'starting',
+          progress: 0,
+          message: `Started processing '${title || fileName}'`,
+          status: 'processing',
+          filename: fileName,
+          title,
+        };
 
-        // Run PDF -> MD
-        const compiledPdfCli = process.platform === 'win32'
-          ? pathMod.join(backendPath, 'dist-cli', 'pdf_cli.exe')
-          : pathMod.join(backendPath, 'dist-cli', 'pdf_cli');
-        const hasCompiledPdf = await (async () => { try { await fs.access(compiledPdfCli); return true; } catch { return false; } })();
-        await new Promise<void>((resolve, reject) => {
-          let child;
-          if (hasCompiledPdf) {
-            child = spawn(compiledPdfCli, ['--pdf', pdfOut, '--outdir', outputDir], { cwd: backendPath, stdio: ['ignore', 'pipe', 'pipe'] });
-          } else {
-            const pythonPath = process.platform === 'win32'
-              ? pathMod.join(backendPath, 'venv-unified', 'Scripts', 'python.exe')
-              : pathMod.join(backendPath, 'venv-unified', 'bin', 'python');
-            const pdfCliPy = pathMod.join(backendPath, 'pdf_cli.py');
-            child = spawn(pythonPath, [pdfCliPy, '--pdf', pdfOut, '--outdir', outputDir], { cwd: backendPath, stdio: ['ignore', 'pipe', 'pipe'] });
-          }
-          let stderr = Buffer.alloc(0);
-          child.stderr?.on('data', d => { stderr = Buffer.concat([stderr, d]); });
-          child.on('close', code => code === 0 ? resolve() : reject(new Error(`pdf_cli exited ${code}: ${stderr.toString()}`)));
-        });
+        // Kick work to background so renderer can poll status
+        (async () => {
+          const update = (patch: Partial<JobStatus>) => {
+            activeJobs[jobId] = { ...activeJobs[jobId], ...patch } as JobStatus;
+          };
+          try {
+            update({ stage: 'saving_pdf', progress: 5, message: 'Saving PDF (0–30%)...' });
+            // Save PDF
+            const pdfOut = pathMod.join(outputDir, fileName || 'input.pdf');
+            await fs.writeFile(pdfOut, Buffer.from(new Uint8Array(pdfData)));
 
-        // Generate TTS
-        const mdPath = pathMod.join(outputDir, 'pdf_result.md');
-        const mdText = await fs.readFile(mdPath, { encoding: 'utf-8' });
-        const audioDir = pathMod.join(outputDir, 'audio');
-        const outPath = pathMod.join(audioDir, voiceCloning?.enabled ? 'voice_cloned_output.wav' : 'output.wav');
+            // PDF -> MD
+            update({ stage: 'converting_pdf', progress: 10, message: 'Converting PDF to text (0–30%)...' });
+            const compiledPdfCli = process.platform === 'win32'
+              ? pathMod.join(backendPath, 'dist-cli', 'pdf_cli.exe')
+              : pathMod.join(backendPath, 'dist-cli', 'pdf_cli');
+            const hasCompiledPdf = await (async () => { try { await fs.access(compiledPdfCli); return true; } catch { return false; } })();
+            await new Promise<void>((resolve, reject) => {
+              let child;
+              if (hasCompiledPdf) {
+                child = spawn(compiledPdfCli, ['--pdf', pdfOut, '--outdir', outputDir], { cwd: backendPath, stdio: ['ignore', 'pipe', 'pipe'] });
+              } else {
+                const pythonPath = process.platform === 'win32'
+                  ? pathMod.join(backendPath, 'venv-unified', 'Scripts', 'python.exe')
+                  : pathMod.join(backendPath, 'venv-unified', 'bin', 'python');
+                const pdfCliPy = pathMod.join(backendPath, 'pdf_cli.py');
+                child = spawn(pythonPath, [pdfCliPy, '--pdf', pdfOut, '--outdir', outputDir], { cwd: backendPath, stdio: ['ignore', 'pipe', 'pipe'] });
+              }
+              let stderr = Buffer.alloc(0);
+              child.stderr?.on('data', d => { stderr = Buffer.concat([stderr, d]); });
+              child.on('close', code => code === 0 ? resolve() : reject(new Error(`pdf_cli exited ${code}: ${stderr.toString()}`)));
+            });
 
-        // Determine prompt
-        let promptPath: string | undefined = undefined;
-        if (voiceCloning?.enabled && voiceCloning?.selectedSampleId) {
-          const samplesDir = pathMod.join(app.getPath('userData'), 'voice-samples');
-          const entries = await fs.readdir(samplesDir, { withFileTypes: true }).catch(() => [] as any);
-          for (const e of entries) {
-            if (!e.isFile()) continue;
-            const base = pathMod.parse(e.name).name;
-            if (base === voiceCloning.selectedSampleId || e.name.startsWith(`${voiceCloning.selectedSampleId}_`)) {
-              promptPath = pathMod.join(samplesDir, e.name);
-              break;
+            // Cap PDF phase at ~30%
+            update({ stage: 'converted_pdf', progress: 30, message: 'PDF converted (30%)' });
+
+            // TTS
+            const mdPath = pathMod.join(outputDir, 'pdf_result.md');
+            const mdText = await fs.readFile(mdPath, { encoding: 'utf-8' });
+            const audioDir = pathMod.join(outputDir, 'audio');
+            const outPath = pathMod.join(audioDir, voiceCloning?.enabled ? 'voice_cloned_output.wav' : 'output.wav');
+
+            // Determine prompt
+            let promptPath: string | undefined = undefined;
+            if (voiceCloning?.enabled && voiceCloning?.selectedSampleId) {
+              const samplesDir = voiceSamplesDir || await loadVoiceSamplesDirFromConfig();
+              const entries = await fs.readdir(samplesDir, { withFileTypes: true }).catch(() => [] as any);
+              for (const e of entries) {
+                if (!e.isFile()) continue;
+                const base = pathMod.parse(e.name).name;
+                if (base === voiceCloning.selectedSampleId || e.name.startsWith(`${voiceCloning.selectedSampleId}_`)) {
+                  promptPath = pathMod.join(samplesDir, e.name);
+                  break;
+                }
+              }
+              if (!promptPath) {
+                console.warn(`[ELECTRON] Voice sample not found for id ${voiceCloning.selectedSampleId} in ${samplesDir}`);
+              }
             }
+
+            // Chunked TTS generation
+            update({ stage: 'generating_audio', progress: 30, message: 'Preparing audio generation (30–60%)...' });
+            const chunks = splitTextIntoChunks(mdText, 300);
+            const totalChunks = chunks.length;
+            const tempChunkFiles: string[] = [];
+            const compiledTtsCli = process.platform === 'win32'
+              ? pathMod.join(backendPath, 'dist-cli', 'chatterbox_tts_cli.exe')
+              : pathMod.join(backendPath, 'dist-cli', 'chatterbox_tts_cli');
+            const hasCompiledTts = await (async () => { try { await fs.access(compiledTtsCli); return true; } catch { return false; } })();
+
+            for (let i = 0; i < totalChunks; i++) {
+              const chunk = chunks[i];
+              const osMod = await import('os');
+              const fsNode = await import('fs/promises');
+              const tmpTextPath = pathMod.join(osMod.tmpdir(), `tts_text_${Date.now()}_${i}.txt`);
+              await fsNode.writeFile(tmpTextPath, chunk, { encoding: 'utf-8' });
+              const chunkOut = pathMod.join(audioDir, `tmp_chunk_${String(i).padStart(4, '0')}.wav`);
+              tempChunkFiles.push(chunkOut);
+
+              update({
+                stage: 'generating_audio',
+                progress: 30 + Math.floor(((i) / Math.max(1, totalChunks)) * 30),
+                message: `Generating audio chunk ${i + 1}/${totalChunks} (30–60%)...`
+              });
+
+              const args = ['--text-file', tmpTextPath, '--out', chunkOut];
+              if (promptPath) { args.push('--prompt', promptPath); }
+              if (voiceCloning) {
+                args.push('--exaggeration', String(voiceCloning.exaggeration ?? 0.5));
+                args.push('--cfg-weight', String(voiceCloning.cfgWeight ?? 0.5));
+              }
+
+              await new Promise<void>((resolve, reject) => {
+                let child;
+                if (hasCompiledTts) {
+                  child = spawn(compiledTtsCli, args, { cwd: backendPath, stdio: ['ignore', 'pipe', 'pipe'], env: { ...process.env, CHB_TTS_DEVICE: 'cpu' } });
+                } else {
+                  const pythonPath = process.platform === 'win32'
+                    ? pathMod.join(backendPath, 'venv-unified', 'Scripts', 'python.exe')
+                    : pathMod.join(backendPath, 'venv-unified', 'bin', 'python');
+                  const cliPy = pathMod.join(backendPath, 'main_cli.py');
+                  child = spawn(pythonPath, [cliPy, ...args], { cwd: backendPath, stdio: ['ignore', 'pipe', 'pipe'], env: { ...process.env, CHB_TTS_DEVICE: 'cpu' } });
+                }
+                let stderr = Buffer.alloc(0);
+                child.stderr?.on('data', d => { stderr = Buffer.concat([stderr, d]); });
+                child.on('close', code => code === 0 ? resolve() : reject(new Error(`tts_cli exited ${code}: ${stderr.toString()}`)));
+              });
+
+              try { await fsNode.unlink(tmpTextPath); } catch {}
+            }
+
+            update({ stage: 'combining_audio', progress: 58, message: 'Combining audio chunks (≈60%)...' });
+            await combineWavs(tempChunkFiles, outPath);
+            // Cleanup chunk files
+            for (const f of tempChunkFiles) {
+              try { await fs.unlink(f); } catch {}
+            }
+
+            // Write metadata for library listing
+            try {
+              const info = {
+                title: title || '',
+                author: author || '',
+                description: description || '',
+                folder: dirName,
+                cover: ''
+              };
+              await fs.writeFile(pathMod.join(outputDir, 'info.json'), JSON.stringify(info, null, 2), { encoding: 'utf-8' });
+            } catch (e) {
+              // Non-fatal: library may not display without info.json
+              console.warn('Failed to write info.json:', e);
+            }
+
+            // Transcribe with WhisperX CLI (allocate ~30%)
+            try {
+              update({ stage: 'transcribing', progress: 60, message: 'Transcribing audio (60–90%)...' });
+              const compiledWhisperCli = process.platform === 'win32'
+                ? pathMod.join(backendPath, 'dist-cli', 'whisperx_cli.exe')
+                : pathMod.join(backendPath, 'dist-cli', 'whisperx_cli');
+              const hasCompiledWhisper = await (async () => { try { await fs.access(compiledWhisperCli); return true; } catch { return false; } })();
+              const audioInput = outPath;
+              const whisperArgs = ['--audio', audioInput, '--outdir', outputDir];
+              await new Promise<void>((resolve, reject) => {
+                let child;
+                if (hasCompiledWhisper) {
+                  child = spawn(compiledWhisperCli, whisperArgs, { cwd: backendPath, stdio: ['ignore', 'pipe', 'pipe'] });
+                } else {
+                  const pythonPath = process.platform === 'win32'
+                    ? pathMod.join(backendPath, 'venv-unified', 'Scripts', 'python.exe')
+                    : pathMod.join(backendPath, 'venv-unified', 'bin', 'python');
+                  const cliPy = pathMod.join(backendPath, 'whisperx_cli.py');
+                  child = spawn(pythonPath, [cliPy, ...whisperArgs], { cwd: backendPath, stdio: ['ignore', 'pipe', 'pipe'] });
+                }
+                let stderr = Buffer.alloc(0);
+                child.stderr?.on('data', d => { stderr = Buffer.concat([stderr, d]); });
+                child.on('close', code => code === 0 ? resolve() : reject(new Error(`whisperx_cli exited ${code}: ${stderr.toString()}`)));
+              });
+              update({ stage: 'transcribed', progress: 90, message: 'Transcription complete (90%)' });
+            } catch (e) {
+              console.warn('Transcription failed; continuing without text mappings:', e);
+            }
+
+            update({ stage: 'finalizing', progress: 95, message: 'Finalizing...' });
+            update({ stage: 'completed', progress: 100, message: `Processed '${title || fileName}' successfully`, status: 'completed', files_created: { audio: true } });
+          } catch (e: any) {
+            const msg = e?.message || String(e);
+            update({ stage: 'failed', progress: -1, message: msg, status: 'failed' });
           }
-        }
+        })();
 
-        const compiledTtsCli = process.platform === 'win32'
-          ? pathMod.join(backendPath, 'dist-cli', 'chatterbox_tts_cli.exe')
-          : pathMod.join(backendPath, 'dist-cli', 'chatterbox_tts_cli');
-        const args = ['--text', mdText, '--out', outPath];
-        if (promptPath) { args.push('--prompt', promptPath); }
-        if (voiceCloning) {
-          args.push('--exaggeration', String(voiceCloning.exaggeration ?? 0.5));
-          args.push('--cfg-weight', String(voiceCloning.cfgWeight ?? 0.5));
-        }
-        // Prefer compiled; fallback to Python + main_cli.py in dev
-        const hasCompiledTts = await (async () => { try { await fs.access(compiledTtsCli); return true; } catch { return false; } })();
-        await new Promise<void>((resolve, reject) => {
-          let child;
-          if (hasCompiledTts) {
-            child = spawn(compiledTtsCli, args, { cwd: backendPath, stdio: ['ignore', 'pipe', 'pipe'] });
-          } else {
-            const pythonPath = process.platform === 'win32'
-              ? pathMod.join(backendPath, 'venv-unified', 'Scripts', 'python.exe')
-              : pathMod.join(backendPath, 'venv-unified', 'bin', 'python');
-            const cliPy = pathMod.join(backendPath, 'main_cli.py');
-            child = spawn(pythonPath, [cliPy, ...args], { cwd: backendPath, stdio: ['ignore', 'pipe', 'pipe'] });
-          }
-          let stderr = Buffer.alloc(0);
-          child.stderr?.on('data', d => { stderr = Buffer.concat([stderr, d]); });
-          child.on('close', code => code === 0 ? resolve() : reject(new Error(`tts_cli exited ${code}: ${stderr.toString()}`)));
-        });
-
-        return { success: true, result: { outputDir, audioPath: outPath } };
+        return { success: true, result: { job_id: jobId, message: `Started processing '${title}' (${fileName})`, filename: fileName, title } };
       }
-
-      // HTTP path (when backend is enabled)
-      const formData = new FormData();
-      const pdfBlob = new Blob([new Uint8Array(pdfData)], { type: 'application/pdf' });
-      formData.append('file', pdfBlob, fileName);
-      formData.append('title', title);
-      formData.append('author', author);
-      formData.append('description', description);
-      formData.append('book_path', bookPath);
-      formData.append('voice_cloning_enabled', String(!!voiceCloning?.enabled));
-      formData.append('voice_cloning_mode', voiceCloning?.selectedSampleId ? 'settings_sample' : 'none');
-      formData.append('voice_sample_id', voiceCloning?.selectedSampleId || '');
-      formData.append('exaggeration', String(voiceCloning?.exaggeration ?? 0.5));
-      formData.append('cfg_weight', String(voiceCloning?.cfgWeight ?? 0.5));
-
-      const response = await fetch(`${API_BASE_URL}/api/books/process-complete`, { method: 'POST', body: formData });
-      if (!response.ok) {
-        const errorText = await response.text();
-        throw new Error(`process-book failed: ${response.status} ${errorText}`);
-      }
-      const result = await response.json();
-      return result;
     } catch (error) {
       console.error("[ELECTRON] Error processing book:", error);
       return { success: false, error: error instanceof Error ? error.message : String(error) };
@@ -820,8 +742,7 @@ app.whenReady().then(async () => {
         throw new Error("Missing required parameters: text and voicePromptFile are required");
       }
 
-      // Local TTS path (no localhost): spawn CLI
-      if (process.env.LOCAL_TTS === '1' || process.env.SKIP_BACKEND === 'true') {
+      const runLocalTts = async (): Promise<{ success: boolean; result?: any; error?: string }> => {
         const tmp = await import('os');
         const fs = await import('fs/promises');
         const p = await import('path');
@@ -837,17 +758,38 @@ app.whenReady().then(async () => {
           ? p.join(backendPath, "dist-cli", "chatterbox_tts_cli.exe")
           : p.join(backendPath, "dist-cli", "chatterbox_tts_cli");
 
+        // Write text to a temp file to avoid long-arg issues
+        const fs2 = await import('fs/promises');
+        const textPath = p.join(tmp.tmpdir(), `vc_text_${Date.now()}.txt`);
+        await fs2.writeFile(textPath, text, { encoding: 'utf-8' });
+
+        const baseEnv = {
+          ...process.env,
+          CHB_TTS_DEVICE: 'cpu',
+          OMP_NUM_THREADS: '1',
+          MKL_NUM_THREADS: '1',
+          OPENBLAS_NUM_THREADS: '1',
+          NUMEXPR_NUM_THREADS: '1',
+          PYTHONWARNINGS: 'ignore',
+          TOKENIZERS_PARALLELISM: 'false',
+          HF_HUB_DISABLE_TELEMETRY: '1',
+          KMP_AFFINITY: 'disabled',
+          KMP_DUPLICATE_LIB_OK: 'TRUE',
+        } as NodeJS.ProcessEnv;
+
+        const modelCfgPath = p.join(backendPath, 'model-config.json');
+
         let child;
-        if (await (async () => { try { const fs2 = await import('fs/promises'); await fs2.access(compiledCli); return true; } catch { return false; } })()) {
-          const args = ["--text", text, "--prompt", promptPath, "--out", outPath, "--exaggeration", String(exaggeration ?? 0.5), "--cfg-weight", String(cfgWeight ?? 0.5)];
-          child = spawn(compiledCli, args, { cwd: backendPath, stdio: ['ignore', 'pipe', 'pipe'] });
+        if (await (async () => { try { const fs3 = await import('fs/promises'); await fs3.access(compiledCli); return true; } catch { return false; } })()) {
+          const args = ["--text-file", textPath, "--prompt", promptPath, "--out", outPath, "--exaggeration", String(exaggeration ?? 0.5), "--cfg-weight", String(cfgWeight ?? 0.5), "--config", modelCfgPath];
+          child = spawn(compiledCli, args, { cwd: backendPath, stdio: ['ignore', 'pipe', 'pipe'], env: baseEnv });
         } else {
           const pythonPath = process.platform === "win32"
             ? p.join(backendPath, "venv-unified", "Scripts", "python.exe")
             : p.join(backendPath, "venv-unified", "bin", "python");
           const cliPath = p.join(backendPath, "main_cli.py");
-          const args = [cliPath, "--text", text, "--prompt", promptPath, "--out", outPath, "--exaggeration", String(exaggeration ?? 0.5), "--cfg-weight", String(cfgWeight ?? 0.5)];
-          child = spawn(pythonPath, args, { cwd: backendPath, stdio: ['ignore', 'pipe', 'pipe'] });
+          const args = [cliPath, "--text-file", textPath, "--prompt", promptPath, "--out", outPath, "--exaggeration", String(exaggeration ?? 0.5), "--cfg-weight", String(cfgWeight ?? 0.5), "--config", modelCfgPath];
+          child = spawn(pythonPath, args, { cwd: backendPath, stdio: ['ignore', 'pipe', 'pipe'], env: baseEnv });
         }
 
         const waitExit = () => new Promise<string>((resolve, reject) => {
@@ -856,31 +798,28 @@ app.whenReady().then(async () => {
           child.stdout?.on('data', (d) => { stdout = Buffer.concat([stdout, d]); });
           child.stderr?.on('data', (d) => { stderr = Buffer.concat([stderr, d]); });
           child.on('close', (code) => {
-            if (code === 0) resolve(stdout.toString().trim() || outPath);
-            else reject(new Error(`CLI exited ${code}: ${stderr.toString()}`));
+            if (code === 0) {
+              // Always trust the known output path; stdout may contain logs
+              resolve(outPath);
+            } else {
+              const msg = stderr.toString() || stdout.toString();
+              if (String(code) === '3221225477') {
+                reject(new Error(`Memory/access violation during generation. Try shorter text and ensure sufficient system memory. Details: ${msg}`));
+              } else {
+                reject(new Error(`CLI exited ${code}: ${msg}`));
+              }
+            }
           });
         });
 
         const resolvedOut = await waitExit();
+        // Cleanup temp text/prompt files
+        try { await fs.unlink(promptPath); } catch {}
+        try { await fs2.unlink(textPath); } catch {}
         return { success: true, result: { audioPath: resolvedOut } };
-      }
+      };
 
-      // Fallback to backend API
-      const formData = new FormData();
-      const audioBlob = new Blob([voicePromptFile], { type: 'audio/wav' });
-      formData.append('text', text);
-      formData.append('audio_prompt_file', audioBlob, 'voice_prompt.wav');
-      formData.append('exaggeration', (exaggeration ?? 0.5).toString());
-      formData.append('cfg_weight', (cfgWeight ?? 0.5).toString());
-
-      const response = await fetch(`${API_BASE_URL}/api/tts/voice-clone`, { method: 'POST', body: formData });
-      if (!response.ok) {
-        const errorText = await response.text();
-        console.error("[ELECTRON] Voice cloning API Error Response:", errorText);
-        throw new Error(`Voice cloning failed: ${response.statusText}`);
-      }
-      const result = await response.json();
-      return result;
+      return await runLocalTts();
     } catch (error) {
       console.error("[ELECTRON] Error generating voice cloned speech:", error);
       return { success: false, error: error instanceof Error ? error.message : String(error) };
@@ -894,7 +833,7 @@ app.whenReady().then(async () => {
       console.log("[ELECTRON] Book data:", bookData);
       console.log("[ELECTRON] Voice cloning options:", voiceCloningOptions);
 
-      if (NO_LOCALHOST) {
+      {
         const pathMod = await import('path');
         const fs = await import('fs/promises');
         const tmp = await import('os');
@@ -902,8 +841,8 @@ app.whenReady().then(async () => {
         // Determine prompt file if voice cloning is enabled
         let promptPath: string | undefined = undefined;
         if (voiceCloningOptions?.enabled && voiceCloningOptions.selectedSampleId) {
-          // Look up sample in userData/voice-samples
-          const dir = pathMod.join(app.getPath('userData'), 'voice-samples');
+          // Look up sample in persisted voice samples directory
+          const dir = voiceSamplesDir || await loadVoiceSamplesDirFromConfig();
           const entries = await fs.readdir(dir, { withFileTypes: true }).catch(() => [] as any);
           for (const e of entries) {
             if (!e.isFile()) continue;
@@ -912,6 +851,9 @@ app.whenReady().then(async () => {
               promptPath = pathMod.join(dir, e.name);
               break;
             }
+          }
+          if (!promptPath) {
+            console.warn(`[ELECTRON] Voice sample not found for id ${voiceCloningOptions.selectedSampleId} in ${dir}`);
           }
         }
 
@@ -952,19 +894,6 @@ app.whenReady().then(async () => {
         await runCli(mdText, promptPath);
         return { success: true, result: { audioPath: outPath } };
       }
-
-      // Fallback to existing backend API
-      const formData = new FormData();
-      formData.append('filename', bookData.name);
-      formData.append('book_path', bookData.bookPath);
-      let endpoint = '/api/books/generate-tts';
-      if (voiceCloningOptions?.enabled && voiceCloningOptions.selectedSampleId) {
-        endpoint = '/api/books/generate-voice-cloned-tts';
-      }
-      const response = await fetch(`${API_BASE_URL}${endpoint}`, { method: 'POST', body: formData });
-      if (!response.ok) { const errorText = await response.text(); throw new Error(`TTS failed: ${errorText}`); }
-      const result = await response.json();
-      return result;
     } catch (error) {
       console.error("[ELECTRON] Error generating TTS:", error);
       return { success: false, error: error instanceof Error ? error.message : String(error) };
@@ -975,28 +904,19 @@ app.whenReady().then(async () => {
   ipcMain.handle("upload-voice-sample", async (event: any, file: ArrayBuffer, name: string, sampleId: string, fileName: string) => {
     try {
       console.log("[ELECTRON] Uploading voice sample:", name, fileName);
-      if (NO_LOCALHOST) {
-        const pathMod = await import('path');
-        const fs = await import('fs/promises');
-        const dir = pathMod.join(app.getPath('userData'), 'voice-samples');
-        await fs.mkdir(dir, { recursive: true });
-        // Preserve original extension
-        const ext = pathMod.extname(fileName) || '.wav';
-        const fname = `${sampleId}_${name.replace(/[^a-z0-9-_]/gi, '_')}${ext}`;
-        const full = pathMod.join(dir, fname);
-        await fs.writeFile(full, Buffer.from(new Uint8Array(file)));
-        return { success: true, result: { id: sampleId, name, fileName: fname, filePath: full } };
-      } else {
-        const formData = new FormData();
-        const fileBlob = new Blob([file], { type: 'audio/wav' });
-        formData.append('file', fileBlob, fileName);
-        formData.append('name', name);
-        formData.append('sample_id', sampleId);
-        const response = await fetch(`${API_BASE_URL}/api/voice-samples/upload`, { method: 'POST', body: formData });
-        if (!response.ok) { const errorText = await response.text(); throw new Error(`Upload failed: ${errorText}`); }
-        const result = await response.json();
-        return result;
-      }
+      const pathMod = await import('path');
+      const fs = await import('fs/promises');
+      const dir = voiceSamplesDir || await loadVoiceSamplesDirFromConfig();
+      await fs.mkdir(dir, { recursive: true });
+      // Preserve original extension
+      const ext = pathMod.extname(fileName) || '.wav';
+      const sanitized = name.replace(/[^a-z0-9-_]/gi, '_');
+      const fname = `${sampleId}_${sanitized}${ext}`;
+      const full = pathMod.join(dir, fname);
+      const data = Buffer.from(new Uint8Array(file));
+      await fs.writeFile(full, data);
+      const stat = await fs.stat(full).catch(() => ({ size: data.byteLength } as any));
+      return { success: true, result: { id: sampleId, name, fileName: fname, filePath: full, fileSize: stat.size } };
     } catch (error) {
       console.error("[ELECTRON] Error uploading voice sample:", error);
       return { success: false, error: error instanceof Error ? error.message : String(error) };
@@ -1008,20 +928,8 @@ app.whenReady().then(async () => {
   ipcMain.handle("get-voice-samples-directory", async (event: any) => {
     try {
       console.log("[ELECTRON] Getting voice samples directory");
-      if (NO_LOCALHOST) {
-        const pathMod = await import('path');
-        const fs = await import('fs/promises');
-        const defaultDir = pathMod.join(app.getPath('userData'), 'voice-samples');
-        await fs.mkdir(defaultDir, { recursive: true });
-        return { success: true, result: { directory: defaultDir } };
-      } else {
-        const response = await fetch(`${API_BASE_URL}/api/voice-samples/directory`, { method: 'GET' });
-        if (!response.ok) throw new Error(`Failed: ${response.statusText}`);
-        const api = await response.json();
-        const directory = api?.result?.directory || api?.directory || (typeof api === 'string' ? api : null);
-        if (directory) return { success: true, result: { directory } };
-        throw new Error('Invalid directory format');
-      }
+      const dir = voiceSamplesDir || await loadVoiceSamplesDirFromConfig();
+      return { success: true, result: { directory: dir } };
     } catch (error) {
       console.error("[ELECTRON] Error getting voice samples directory:", error);
       return { success: false, error: error instanceof Error ? error.message : String(error) };
@@ -1031,26 +939,36 @@ app.whenReady().then(async () => {
   ipcMain.handle("list-voice-samples", async (event: any) => {
     try {
       console.log("[ELECTRON] Listing voice samples");
-      if (NO_LOCALHOST) {
-        const pathMod = await import('path');
-        const fs = await import('fs/promises');
-        const dir = pathMod.join(app.getPath('userData'), 'voice-samples');
-        await fs.mkdir(dir, { recursive: true });
-        const entries = await fs.readdir(dir, { withFileTypes: true });
-        const audioExt = new Set(['.wav', '.mp3', '.flac', '.ogg', '.m4a']);
-        const files = await Promise.all(entries.filter(e => e.isFile() && audioExt.has(pathMod.extname(e.name).toLowerCase())).map(async e => {
-          const full = pathMod.join(dir, e.name);
-          const stat = await fs.stat(full);
-          const id = pathMod.parse(e.name).name; // base name
-          return { id, name: id, fileName: e.name, filePath: full, fileSize: stat.size };
-        }));
-        return { success: true, result: files };
-      } else {
-        const response = await fetch(`${API_BASE_URL}/api/voice-samples`, { method: 'GET' });
-        if (!response.ok) throw new Error(`Failed: ${response.statusText}`);
-        const result = await response.json();
-        return result;
-      }
+      const pathMod = await import('path');
+      const fs = await import('fs/promises');
+      const dir = voiceSamplesDir || await loadVoiceSamplesDirFromConfig();
+      await fs.mkdir(dir, { recursive: true });
+      const entries = await fs.readdir(dir, { withFileTypes: true });
+      const audioExt = new Set(['.wav', '.mp3', '.flac', '.ogg', '.m4a']);
+      const files = await Promise.all(entries.filter(e => e.isFile() && audioExt.has(pathMod.extname(e.name).toLowerCase())).map(async e => {
+        const full = pathMod.join(dir, e.name);
+        const stat = await fs.stat(full);
+        const ext = pathMod.extname(e.name);
+        const baseNoExt = pathMod.basename(e.name, ext);
+        let id = baseNoExt;
+        let displayName = baseNoExt;
+        if (baseNoExt.startsWith('sample_')) {
+          const parts = baseNoExt.split('_');
+          if (parts.length >= 3) {
+            id = `${parts[0]}_${parts[1]}`; // sample_timestamp
+            displayName = parts.slice(2).join('_');
+          }
+        } else {
+          const parts = baseNoExt.split('_');
+          if (parts.length >= 2) {
+            id = parts[0];
+            displayName = parts.slice(1).join('_');
+          }
+        }
+        return { id, name: displayName, fileName: e.name, filePath: full, fileSize: stat.size, uploadTime: stat.mtimeMs };
+      }));
+      files.sort((a, b) => (b.uploadTime || 0) - (a.uploadTime || 0));
+      return { success: true, result: files };
     } catch (error) {
       console.error("[ELECTRON] Error listing voice samples:", error);
       return { success: false, error: error instanceof Error ? error.message : String(error) };
@@ -1060,19 +978,14 @@ app.whenReady().then(async () => {
   ipcMain.handle("set-voice-samples-directory", async (event: any, directory: string) => {
     try {
       console.log("[ELECTRON] Setting voice samples directory:", directory);
-      if (NO_LOCALHOST) {
-        const fs = await import('fs/promises');
-        await fs.mkdir(directory, { recursive: true });
-        return { success: true, result: { directory } };
-      } else {
-        const formData = new FormData();
-        formData.append('directory', directory);
-        const response = await fetch(`${API_BASE_URL}/api/voice-samples/directory`, { method: 'POST', body: formData });
-        if (!response.ok) throw new Error(`Failed: ${response.statusText}`);
-        const api = await response.json();
-        const resolved = api?.result?.directory || api?.directory || directory;
-        return { success: true, result: { directory: resolved } };
-      }
+      const fs = await import('fs/promises');
+      await fs.mkdir(directory, { recursive: true });
+      const testPath = path.join(directory, '.__writetest.tmp');
+      await fs.writeFile(testPath, 'ok');
+      await fs.unlink(testPath).catch(() => {});
+      voiceSamplesDir = directory;
+      await saveVoiceSamplesDirToConfig(directory);
+      return { success: true, result: { directory } };
     } catch (error) {
       console.error("[ELECTRON] Error setting voice samples directory:", error);
       return { success: false, error: error instanceof Error ? error.message : String(error) };
@@ -1082,26 +995,19 @@ app.whenReady().then(async () => {
   ipcMain.handle("delete-voice-sample", async (event: any, sampleId: string) => {
     try {
       console.log("[ELECTRON] Deleting voice sample:", sampleId);
-      if (NO_LOCALHOST) {
-        const pathMod = await import('path');
-        const fs = await import('fs/promises');
-        const dir = pathMod.join(app.getPath('userData'), 'voice-samples');
-        const entries = await fs.readdir(dir, { withFileTypes: true });
-        for (const e of entries) {
-          if (!e.isFile()) continue;
-          const name = pathMod.parse(e.name).name;
-          if (name === sampleId || e.name.startsWith(`${sampleId}_`)) {
-            await fs.unlink(pathMod.join(dir, e.name));
-            return { success: true, result: `Voice sample ${sampleId} deleted` };
-          }
+      const pathMod = await import('path');
+      const fs = await import('fs/promises');
+      const dir = voiceSamplesDir || await loadVoiceSamplesDirFromConfig();
+      const entries = await fs.readdir(dir, { withFileTypes: true });
+      for (const e of entries) {
+        if (!e.isFile()) continue;
+        const name = pathMod.parse(e.name).name;
+        if (name === sampleId || e.name.startsWith(`${sampleId}_`)) {
+          await fs.unlink(pathMod.join(dir, e.name));
+          return { success: true, result: `Voice sample ${sampleId} deleted` };
         }
-        return { success: false, error: `Voice sample ${sampleId} not found` };
-      } else {
-        const response = await fetch(`${API_BASE_URL}/api/voice-samples/${sampleId}`, { method: 'DELETE' });
-        if (!response.ok) throw new Error(`Failed: ${response.statusText}`);
-        const result = await response.json();
-        return result;
       }
+      return { success: false, error: `Voice sample ${sampleId} not found` };
     } catch (error) {
       console.error("[ELECTRON] Error deleting voice sample:", error);
       return { success: false, error: error instanceof Error ? error.message : String(error) };
@@ -1110,24 +1016,19 @@ app.whenReady().then(async () => {
 
   ipcMain.handle("get-voice-sample-url", async (event: any, sampleId: string) => {
     try {
-      if (NO_LOCALHOST) {
-        const pathMod = await import('path');
-        const fs = await import('fs/promises');
-        const dir = pathMod.join(app.getPath('userData'), 'voice-samples');
-        const entries = await fs.readdir(dir, { withFileTypes: true });
-        for (const e of entries) {
-          if (!e.isFile()) continue;
-          const name = pathMod.parse(e.name).name;
-          if (name === sampleId || e.name.startsWith(`${sampleId}_`)) {
-            const full = pathMod.join(dir, e.name);
-            return { success: true, result: full };
-          }
+      const pathMod = await import('path');
+      const fs = await import('fs/promises');
+      const dir = voiceSamplesDir || await loadVoiceSamplesDirFromConfig();
+      const entries = await fs.readdir(dir, { withFileTypes: true });
+      for (const e of entries) {
+        if (!e.isFile()) continue;
+        const name = pathMod.parse(e.name).name;
+        if (name === sampleId || e.name.startsWith(`${sampleId}_`)) {
+          const full = pathMod.join(dir, e.name);
+          return { success: true, result: full };
         }
-        return { success: false, error: 'Not found' };
-      } else {
-        const url = `${API_BASE_URL}/api/voice-samples/${sampleId}/file`;
-        return { success: true, result: url };
       }
+      return { success: false, error: 'Not found' };
     } catch (error) {
       console.error("[ELECTRON] Error getting voice sample URL:", error);
       return { success: false, error: error instanceof Error ? error.message : String(error) };
@@ -1144,26 +1045,9 @@ app.whenReady().then(async () => {
 });
 
 app.on('window-all-closed', () => {
-  if (apiServerProcess) {
-    console.log("Terminating API server process...");
-    apiServerProcess.kill('SIGTERM');
-    // Force kill after 5 seconds if it doesn't exit gracefully
-    setTimeout(() => {
-      if (apiServerProcess && !apiServerProcess.killed) {
-        console.log("Force killing API server process...");
-        apiServerProcess.kill('SIGKILL');
-      }
-    }, 5000);
-  }
-  
   if (process.platform !== 'darwin') {
     app.quit();
   }
 });
 
-app.on('before-quit', () => {
-  if (apiServerProcess) {
-    console.log("Terminating API server process before quit...");
-    apiServerProcess.kill('SIGTERM');
-  }
-});
+app.on('before-quit', () => {});
