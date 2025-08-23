@@ -1,3 +1,4 @@
+# Core dependencies
 beautifulsoup4==4.13.4
 certifi==2025.7.14
 cffi==1.17.1
@@ -16,7 +17,6 @@ lxml==6.0.0
 magika==0.6.2
 mammoth==1.9.1
 markdownify==1.1.0
-# markitdown from local source - will install separately
 mpmath==1.3.0
 numpy==2.3.1
 onnxruntime==1.20.1
@@ -52,3 +52,48 @@ torch>=2.0.0
 torchaudio>=2.0.0
 transformers>=4.30.0
 safetensors>=0.3.0
+
+# FastAPI and web dependencies
+fastapi>=0.116.0
+uvicorn>=0.35.0
+python-multipart>=0.0.20
+aiofiles>=24.1.0
+
+# Audio processing dependencies
+resampy>=0.4.3
+webrtcvad>=2.0.10
+av>=12.3.0
+
+# PDF and document processing
+pdfplumber>=0.11.7
+pypdfium2>=4.30.0
+
+# Development and build tools
+pyinstaller>=6.14.0
+nuitka>=2.7.0
+psutil>=7.0.0
+
+# WhisperX dependencies
+faster-whisper>=1.1.0
+ctranslate2>=4.4.0
+
+# Additional TTS dependencies
+tokenizers>=0.20.0
+
+# =============================================================================
+# SOURCE-BUILT PACKAGES - INSTALL SEPARATELY AFTER PIP INSTALLING ABOVE
+# =============================================================================
+#
+# These packages are built from source and must be installed separately:
+#
+# 1. Chatterbox TTS (from local source):
+#    cd backend-api/chatterbox
+#    pip install -e .
+#
+# 2. WhisperX (from local source):
+#    cd backend-api/whisperX-3.4.2
+#    pip install -e .
+#
+# 3. MarkItDown (from local source):
+#    cd backend-api/markitdown-source/packages/markitdown
+#    pip install -e .
