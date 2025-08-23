@@ -1,0 +1,25 @@
+{
+  "chatterbox": {
+    "device": "cpu",
+    "source": "bundled",
+    "bundled_dir": "chatterbox_models/models--ResembleAI--chatterbox/snapshots/1b475dffa71fb191cb6d5901215eb6f55635a9b6",
+    "hf_repo": "ResembleAI/chatterbox",
+    "target_sr": 24000
+  },
+  "whisperx": {
+    "asr_model": "small",
+    "device": "cpu",
+    "compute_type": "int8",
+    "align": true,
+    "batch_size": 4,
+    "models_dir": "whisperx_models"
+  }
+}
+
+// {
+//   "chatterbox": {
+//     "backend": "openvino",
+//     "openvino_dir": "chatterbox_openvino",
+//     "ov_device": "AUTO:NPU,CPU"
+//   }
+// }

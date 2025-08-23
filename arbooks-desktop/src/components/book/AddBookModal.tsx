@@ -22,14 +22,18 @@ const AddBookModal = forwardRef<HTMLDialogElement, {}>((props, addBookModalRef) 
   const [progress, setProgress] = useState(0);
   const [selectedFile, setSelectedFile] = useState<File | null>(null);
   const [voicePromptFile, setVoicePromptFile] = useState<File | null>(null);
-  const [uploading, setUploading] = useState(false);
+  // Uploading/job progress moved to global store to persist across navigation
   const useEnhancedPipeline = true; // Always use enhanced pipeline for better UX
   const [useVoiceCloning, setUseVoiceCloning] = useState(false);
   const [systemStatus, setSystemStatus] = useState<any>(null);
-  const [jobId, setJobId] = useState<string | null>(null);
-  const [processingStatus, setProcessingStatus] = useState<ProcessingStatus | null>(null);
   const { listBooks } = useListBooks();
-  const { settings: { bookPath, voiceCloning } } = useStore();
+  const { 
+    settings: { bookPath, voiceCloning },
+    processing,
+    startProcessing,
+    updateProcessingStatus,
+    clearProcessing,
+  } = useStore();
 
   // Performance tracking
   const processingStartTime = useRef<number | null>(null);
@@ -43,16 +47,18 @@ const AddBookModal = forwardRef<HTMLDialogElement, {}>((props, addBookModalRef) 
     // No-op: removed system status check from Add Book to keep UI minimal
   }, []);
 
-  // Poll processing status when we have a job ID
+  // Poll processing status when we have a job ID (persisted in store)
+  const jobNotFoundAttempts = useRef<number>(0);
   useEffect(() => {
-    if (jobId && uploading) {
+    if (processing.currentJobId && processing.uploading) {
       const pollStatus = async () => {
         try {
-          const result = await window.electron.getProcessingStatus(jobId);
+          const result = await window.electron.getProcessingStatus(processing.currentJobId!);
           
           if (result.success) {
+            jobNotFoundAttempts.current = 0;
             const status = result.result as ProcessingStatus;
-            setProcessingStatus(status);
+            updateProcessingStatus(status);
             setUploadInfo(status.message);
             setProgress(status.progress);
 
@@ -73,7 +79,6 @@ const AddBookModal = forwardRef<HTMLDialogElement, {}>((props, addBookModalRef) 
             }
 
             if (status.status === 'completed') {
-              setUploading(false);
               setSuccess(`Book "${title}" processed successfully!`);
               
               // Log performance metrics
@@ -100,10 +105,10 @@ const AddBookModal = forwardRef<HTMLDialogElement, {}>((props, addBookModalRef) 
                 console.log(`─────────────────────────────────────────────────────`);
               }
               
-              resetForm();
               if (bookPath) listBooks(bookPath);
+              clearProcessing();
+              resetForm();
             } else if (status.status === 'failed') {
-              setUploading(false);
               setError(status.message);
               
               // Log failed processing metrics
@@ -115,12 +120,31 @@ const AddBookModal = forwardRef<HTMLDialogElement, {}>((props, addBookModalRef) 
                 console.log(`💥 Error: ${status.message}`);
                 console.log(`─────────────────────────────────────────────────────`);
               }
+              clearProcessing();
             }
           } else {
             console.error(`Status poll failed:`, result.error);
+            // Gracefully retry a few times on transient "Job not found"
+            const errMsg = (result.error || '').toLowerCase();
+            if (errMsg.includes('job not found') && jobNotFoundAttempts.current < 3) {
+              jobNotFoundAttempts.current += 1;
+              return; // keep polling
+            }
+            // If the backend lost the job (e.g., app reload), stop polling and unlock UI.
+            // For 'job not found' specifically, clear silently (no error banner).
+            if (errMsg.includes('job not found')) {
+              setUploadInfo("");
+              setProgress(0);
+              clearProcessing();
+              return;
+            }
+            setError(result.error || 'Processing failed, please try again.');
+            clearProcessing();
           }
         } catch (err) {
           console.error('Error polling status:', err);
+          // Stop polling on repeated failures to avoid locking the modal
+          clearProcessing();
         }
       };
 
@@ -132,7 +156,7 @@ const AddBookModal = forwardRef<HTMLDialogElement, {}>((props, addBookModalRef) 
         clearInterval(interval);
       };
     }
-  }, [jobId, uploading, title, bookPath, listBooks]);
+  }, [processing.currentJobId, processing.uploading, title, bookPath, listBooks, updateProcessingStatus, clearProcessing]);
 
   const checkSystemStatus = async () => {};
 
@@ -143,8 +167,6 @@ const AddBookModal = forwardRef<HTMLDialogElement, {}>((props, addBookModalRef) 
     setSelectedFile(null);
     setVoicePromptFile(null);
     setUseVoiceCloning(false);
-    setJobId(null);
-    setProcessingStatus(null);
     
     // Reset performance tracking
     processingStartTime.current = null;
@@ -221,7 +243,6 @@ const AddBookModal = forwardRef<HTMLDialogElement, {}>((props, addBookModalRef) 
 
     const reader = new FileReader();
     reader.onload = async () => {
-      setUploading(true);
       const fileData = reader.result as ArrayBuffer;
 
       const bookInfo = {
@@ -329,7 +350,7 @@ const AddBookModal = forwardRef<HTMLDialogElement, {}>((props, addBookModalRef) 
           throw new Error('No job ID received from server');
         }
         
-        setJobId(newJobId);
+        startProcessing(newJobId, { title, filename: actualResult.filename || selectedFile?.name });
         
         const displayName = actualResult.filename || actualResult.title || selectedFile?.name || 'your book';
         setUploadInfo(`Started processing ${displayName}...`);
@@ -339,7 +360,6 @@ const AddBookModal = forwardRef<HTMLDialogElement, {}>((props, addBookModalRef) 
       } catch (error: any) {
         setError(error.message);
         console.error(error);
-        setUploading(false);
         setUploadInfo("");
         
         // Log initial processing failure
@@ -380,9 +400,9 @@ const AddBookModal = forwardRef<HTMLDialogElement, {}>((props, addBookModalRef) 
               </svg>
               <div>
                 <span>{uploadInfo}</span>
-                {processingStatus && (
+                {processing.status && (
                   <div className="text-xs mt-1 opacity-75">
-                    Stage: {processingStatus.stage} | Status: {processingStatus.status}
+                    Stage: {processing.status.stage} | Status: {processing.status.status}
                   </div>
                 )}
               </div>
@@ -409,7 +429,7 @@ const AddBookModal = forwardRef<HTMLDialogElement, {}>((props, addBookModalRef) 
             <input
               type="text"
               value={title}
-              disabled={uploading}
+              disabled={processing.uploading}
               onChange={(e) => setTitle(e.target.value)}
               className="input input-secondary w-full"
               placeholder="Alice in Wonderland" />
@@ -420,7 +440,7 @@ const AddBookModal = forwardRef<HTMLDialogElement, {}>((props, addBookModalRef) 
             <input
               type="text"
               value={author}
-              disabled={uploading}
+              disabled={processing.uploading}
               onChange={(e) => setAuthor(e.target.value)}
               className="input input-secondary w-full"
               placeholder="Lewis Carroll" />
@@ -431,7 +451,7 @@ const AddBookModal = forwardRef<HTMLDialogElement, {}>((props, addBookModalRef) 
             <textarea
               className="textarea textarea-secondary w-full h-24 resize-none"
               value={description}
-              disabled={uploading}
+              disabled={processing.uploading}
               onChange={(e) => setDescription(e.target.value)}
               placeholder="Girl falls into surreal world, meets odd creatures, adventures ensue."
             ></textarea>
@@ -441,7 +461,7 @@ const AddBookModal = forwardRef<HTMLDialogElement, {}>((props, addBookModalRef) 
             <legend className="fieldset-legend">Books must be uploaded in PDF Format</legend>
             <input
               type="file"
-              disabled={uploading}
+              disabled={processing.uploading}
               onChange={handleFileChange}
               className="file-input file-input-secondary w-full" />
           </fieldset>
@@ -454,10 +474,10 @@ const AddBookModal = forwardRef<HTMLDialogElement, {}>((props, addBookModalRef) 
         <div className="space-x-3 mt-5">
           <button
             onClick={uploadBook}
-            disabled={uploading}
+            disabled={processing.uploading}
             className="btn btn-secondary">
             <HiArrowUpTray className='w-5 h-5' />
-            {uploading ? 'Processing...' : 'Add Book'}
+            {processing.uploading ? 'Processing...' : 'Add Book'}
           </button>
           
           

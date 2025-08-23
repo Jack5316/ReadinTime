@@ -15,6 +15,7 @@ const Library: FC = () => {
   const cardRef = useRef<HTMLDivElement>(null);
   const [currentPage, setCurrentPage] = useState(0);
   const [pageCapacity, setPageCapacity] = useState(12);
+  const [colorSeed, setColorSeed] = useState(0); // Add state for color regeneration
 
   useEffect(() => {
     if (!bookPath) return;
@@ -67,9 +68,16 @@ const Library: FC = () => {
   ] as const;
 
   const getGradientFor = (seed: string) => {
-    const h = seed.split('')
+    // Use the colorSeed state to make colors change randomly
+    const combinedSeed = seed + '|' + colorSeed;
+    const h = combinedSeed.split('')
       .reduce((acc, ch) => ((acc * 31) + ch.charCodeAt(0)) >>> 0, 0);
     return CHILD_GRADIENTS[h % CHILD_GRADIENTS.length];
+  };
+
+  // Function to regenerate colors randomly
+  const regenerateColors = () => {
+    setColorSeed(prev => prev + 1);
   };
 
   return (
@@ -87,7 +95,7 @@ const Library: FC = () => {
         </div>
       )}
 
-      <div className='card w-full shadow-xl'>
+      <div className='card w-full shadow-xl bg-base-100'>
         <div className="card-body">
           <div className="w-full flex justify-between items-start">
             <div>
@@ -98,6 +106,9 @@ const Library: FC = () => {
               <button className="btn btn-primary" onClick={() => {
                 if (bookPath) { listBooks(bookPath); }
               }}><HiArrowPath className='w-5 h-5' />Refresh</button>
+              <button className="btn btn-secondary" onClick={regenerateColors}>
+                <HiArrowPath className='w-5 h-5' />Regenerate Colors
+              </button>
               <button className="btn btn-primary" onClick={() => addBookModalRef.current?.showModal()}><HiArrowUpTray className='w-5 h-5' />Add Book</button>
             </div>
           </div>
@@ -123,6 +134,10 @@ const Library: FC = () => {
                           placeholder.className = `w-full h-48 ${gradient} flex items-center justify-center text-white text-2xl font-bold`;
                           placeholder.textContent = book.title.charAt(0).toUpperCase();
                           img.parentElement?.appendChild(placeholder);
+                        }}
+                        onLoad={() => {
+                          // Cover loaded successfully
+                          console.log(`Cover loaded for "${book.title}": ${book.cover}`);
                         }}
                       />
                     ) : (

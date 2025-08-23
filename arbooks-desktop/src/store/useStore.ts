@@ -2,6 +2,24 @@ import { create } from "zustand";
 import { devtools, persist } from "zustand/middleware";
 import { SettingsState, VoiceSample, MODES } from "./settings";
 
+type ProcessingStatus = {
+  stage: string;
+  progress: number;
+  message: string;
+  status: 'processing' | 'completed' | 'failed';
+  files_created?: Record<string, boolean>;
+  filename?: string;
+  title?: string;
+};
+
+type ProcessingState = {
+  currentJobId: string | null;
+  uploading: boolean;
+  status: ProcessingStatus | null;
+  startedAt: number | null;
+  meta?: { title?: string; filename?: string } | null;
+};
+
 interface AppState {
   settings: SettingsState;
   updateSettings: (settings: SettingsState) => void;
@@ -10,6 +28,10 @@ interface AppState {
   selectVoiceSample: (voiceSampleId: string | null) => void;
   updateVoiceSample: (voiceSampleId: string, updates: Partial<VoiceSample>) => void;
   loadVoiceSamples: (voiceSamples: VoiceSample[]) => void;
+  processing: ProcessingState;
+  startProcessing: (jobId: string, meta?: { title?: string; filename?: string }) => void;
+  updateProcessingStatus: (status: ProcessingStatus) => void;
+  clearProcessing: () => void;
 }
 
 const defaultSettings: SettingsState = {
@@ -35,6 +57,14 @@ const defaultSettings: SettingsState = {
     voicePromptPath: null,
   },
 }
+
+const defaultProcessingState: ProcessingState = {
+  currentJobId: null,
+  uploading: false,
+  status: null,
+  startedAt: null,
+  meta: null,
+};
 
 // Helper function to validate and fix settings
 const validateAndFixSettings = (settings: any): SettingsState => {
@@ -76,9 +106,35 @@ const useStore = create<AppState>()(
     persist(
       (set, get) => ({
         settings: defaultSettings,
+        processing: defaultProcessingState,
         updateSettings: (settings) => {
           const validatedSettings = validateAndFixSettings(settings);
           set({ settings: validatedSettings });
+        },
+        startProcessing: (jobId, meta) => {
+          set({
+            processing: {
+              currentJobId: jobId,
+              uploading: true,
+              status: null,
+              startedAt: Date.now(),
+              meta: meta || null,
+            },
+          });
+        },
+        updateProcessingStatus: (status) => {
+          const current = get().processing;
+          const uploading = status.status === 'processing';
+          set({
+            processing: {
+              ...current,
+              uploading,
+              status,
+            },
+          });
+        },
+        clearProcessing: () => {
+          set({ processing: defaultProcessingState });
         },
         
         addVoiceSample: (voiceSample) => {
@@ -188,9 +244,21 @@ const useStore = create<AppState>()(
           if (persistedState && persistedState.settings) {
             console.log('Validating persisted settings...');
             persistedState.settings = validateAndFixSettings(persistedState.settings);
+            if (!persistedState.processing) {
+              persistedState.processing = defaultProcessingState;
+            } else {
+              const p = persistedState.processing;
+              persistedState.processing = {
+                currentJobId: typeof p.currentJobId === 'string' ? p.currentJobId : null,
+                uploading: !!p.uploading,
+                status: p.status || null,
+                startedAt: typeof p.startedAt === 'number' ? p.startedAt : null,
+                meta: p.meta || null,
+              } as ProcessingState;
+            }
           } else {
             console.log('No valid persisted state found, using defaults');
-            return { settings: defaultSettings };
+            return { settings: defaultSettings, processing: defaultProcessingState };
           }
           
           return persistedState;

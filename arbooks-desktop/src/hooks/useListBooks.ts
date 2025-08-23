@@ -39,15 +39,21 @@ const useListBooks = () => {
 
           // Attempt 1: explicit cover path if provided
           let coverPath = resolveCoverPath(book.cover || '');
+          console.log(`Book "${book.title}": cover field="${book.cover}", resolved path="${coverPath}"`);
           let blobURL = coverPath ? await tryLoadCover(coverPath) : '';
           
-          // Attempt 2: common filenames inside folder
+          // Attempt 2: common filenames inside folder (including extracted covers)
           if (!blobURL) {
+            console.log(`Book "${book.title}": trying common cover filenames...`);
             const candidates = ['cover.png', 'cover.jpg', 'cover.jpeg', 'thumbnail.png', 'thumbnail.jpg'];
             for (const name of candidates) {
               const p = joinPath(bookPath, book.folder, name);
+              console.log(`Book "${book.title}": trying ${p}`);
               blobURL = await tryLoadCover(p);
-              if (blobURL) break;
+              if (blobURL) {
+                console.log(`Book "${book.title}": found cover at ${p}`);
+                break;
+              }
             }
           }
 
@@ -55,6 +61,8 @@ const useListBooks = () => {
             console.log(`Book "${book.title}" has no cover image, using placeholder`);
             return { ...book, cover: '' };
           }
+          
+          console.log(`Book "${book.title}" loaded cover: ${blobURL}`);
           return { ...book, cover: blobURL };
         } catch (error) {
           console.error(`Error processing book "${book.title}":`, error);

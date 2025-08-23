@@ -3,8 +3,8 @@ import { get as getAppRootDir } from "app-root-dir";
 import path from 'path';
 import dotenv from "dotenv";
 import { readFileSync } from "fs";
-import { BookInfo, BookUploadData } from "../src/types/book"
-import { Result } from "../src/types/result"
+import type { BookInfo, BookUploadData } from "../src/types/book"
+import type { Result } from "../src/types/result"
 import { spawn } from "child_process";
 import http from 'http';
 
@@ -33,6 +33,7 @@ devLog("ROOT DIR:", getAppRootDir());
 devLog("PLATFORM:", process.platform);
 
 const VITE_PORT = 5173;
+const FORCE_OFFLINE = process.env.ELECTRON_OFFLINE === '1';
 // Offline-only mode: all operations run locally via IPC/CLI; no localhost HTTP
 
 // Voice samples directory state (persisted to userData)
@@ -70,6 +71,10 @@ async function saveVoiceSamplesDirToConfig(dir: string): Promise<void> {
 
 let mainWindow: BrowserWindow | null = null;
 const isDev = process.env.NODE_ENV === 'development' || !app.isPackaged;
+
+// Prevent rapid F11 toggling
+let lastF11Toggle = 0;
+const F11_DEBOUNCE_MS = 300; // Minimum time between F11 toggles
 
 // Offline job tracking (NO_LOCALHOST): mirror backend active_jobs for progress polling
 type JobStatus = {
@@ -267,37 +272,44 @@ async function createWindow() {
           break
       }
     } else if (input.key.toLowerCase() === 'f11') {
-      mainWindow.setFullScreen(!mainWindow.isFullScreen())
+      // F11: Toggle window frame visibility (true fullscreen) with debouncing
+      const now = Date.now();
+      if (now - lastF11Toggle > F11_DEBOUNCE_MS) {
+        lastF11Toggle = now;
+        if (mainWindow.isFullScreen()) {
+          mainWindow.setFullScreen(false);
+        } else {
+          mainWindow.setFullScreen(true);
+        }
+      }
     } else if (input.key.toLowerCase() === 'escape') {
       // ESC key exits fullscreen mode
       if (mainWindow.isFullScreen()) {
-        mainWindow.setFullScreen(false)
+        mainWindow.setFullScreen(false);
       }
     }
-    // Ctrl+Alt+F toggles true borderless fullscreen (kiosk)
+    // Ctrl+Alt+F toggles immersive reading mode (like clicking the fullscreen button in Book page)
     if ((input.control || input.meta) && input.alt && input.key.toLowerCase() === 'f') {
-      const isKiosk = mainWindow.isKiosk();
-      mainWindow.setKiosk(!isKiosk);
-      if (!isKiosk) {
-        mainWindow.setMenuBarVisibility(false);
-        mainWindow.setAutoHideMenuBar(true);
-      }
+      // Send message to renderer to toggle immersive reading mode
+      mainWindow.webContents.send('toggle-immersive-reading');
     }
   })
 
-    // Check if Vite dev server is running and load accordingly
-    let viteRunning = await isViteServerRunning();
+
+
+    // Check if Vite dev server is running and load accordingly (unless forced offline)
+    let viteRunning = !FORCE_OFFLINE && await isViteServerRunning();
     console.log(`Vite server running check: ${viteRunning}`);
     
     // If Vite is not running, wait a bit and retry (useful for development)
-    if (!viteRunning && isDev) {
+    if (!viteRunning && isDev && !FORCE_OFFLINE) {
       console.log("Vite not running, waiting 2 seconds and retrying...");
       await new Promise(resolve => setTimeout(resolve, 2000));
       viteRunning = await isViteServerRunning();
       console.log(`Vite server running check after retry: ${viteRunning}`);
     }
     
-    if (viteRunning) {
+    if (viteRunning && !FORCE_OFFLINE) {
       const devUrl = `http://localhost:${VITE_PORT}`;
       console.log("Loading from Vite dev server:", devUrl);
       mainWindow.loadURL(devUrl);
@@ -390,6 +402,14 @@ app.whenReady().then(async () => {
       mainWindow.setAutoHideMenuBar(true);
     }
     return { success: true, kiosk: !isKiosk };
+  });
+
+  // Toggle immersive reading mode from renderer
+  ipcMain.handle('toggle-immersive-reading', async () => {
+    if (!mainWindow) return { success: false };
+    // Send message to renderer to toggle immersive reading mode
+    mainWindow.webContents.send('toggle-immersive-reading');
+    return { success: true };
   });
 
   ipcMain.handle("list-books", async (event: any, directoryPath: string) => {

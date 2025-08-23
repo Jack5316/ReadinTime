@@ -1,4 +1,4 @@
-import React, { useState, useRef } from 'react';
+import React, { useEffect, useMemo, useRef, useState } from 'react';
 import useVoiceCloningTTS from '../../hooks/useVoiceCloningTTS';
 import useStore from '../../store/useStore';
 import '../../global';
@@ -7,13 +7,36 @@ const VoiceCloningDemo: React.FC = () => {
   const [text, setText] = useState('Hello! This is a test of voice cloning technology using Chatterbox.');
   const [voiceFile, setVoiceFile] = useState<File | null>(null);
   const [audioUrl, setAudioUrl] = useState<string | null>(null);
+  const [source, setSource] = useState<'upload' | 'saved'>('upload');
+  const [selectedSampleId, setSelectedSampleId] = useState<string | null>(null);
   const audioRef = useRef<HTMLAudioElement>(null);
   
   const { generateSpeech, isGenerating, error } = useVoiceCloningTTS();
-  const { settings } = useStore();
+  const { settings, loadVoiceSamples } = useStore();
   
   // Check if running in Electron environment
   const isElectronAvailable = typeof window !== 'undefined' && window.electron;
+
+  // Load saved samples initially
+  useEffect(() => {
+    const refresh = async () => {
+      if (!isElectronAvailable || !window.electron.listVoiceSamples) return;
+      try {
+        const res = await window.electron.listVoiceSamples();
+        if (res?.success && Array.isArray(res.result)) {
+          loadVoiceSamples(res.result);
+        }
+      } catch {}
+    };
+    refresh();
+  }, [isElectronAvailable, loadVoiceSamples]);
+
+  // Initialize selected sample if available
+  useEffect(() => {
+    if (!selectedSampleId && (settings.voiceCloning.voiceSamples?.length || 0) > 0) {
+      setSelectedSampleId(settings.voiceCloning.voiceSamples[0].id);
+    }
+  }, [settings.voiceCloning.voiceSamples, selectedSampleId]);
 
   const handleFileChange = (e: React.ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0];
@@ -22,20 +45,61 @@ const VoiceCloningDemo: React.FC = () => {
     }
   };
 
+  const loadAudioAsBlobUrl = useMemo(() => {
+    return async (pathOrUrl: string) => {
+      try {
+        if (!isElectronAvailable || !window.electron.getFileData) return pathOrUrl;
+        const res = await window.electron.getFileData(pathOrUrl);
+        if (!res?.success) return pathOrUrl;
+        const blob = new Blob([res.result], { type: 'audio/wav' });
+        const url = URL.createObjectURL(blob);
+        return url;
+      } catch {
+        return pathOrUrl;
+      }
+    };
+  }, [isElectronAvailable]);
+
   const handleGenerate = async () => {
-    if (!voiceFile) return;
-    
-    const result = await generateSpeech(text, voiceFile);
-    
-    if (result.success && result.result) {
-      // Use direct file path (offline mode). Backend URL only if needed.
-      const resultData = result.result as any;
-      const audioPath = resultData.audioPath || result.result;
-      setAudioUrl(audioPath);
+    let promptToUse: File | null = null;
+    try {
+      if (source === 'upload') {
+        if (!voiceFile) return;
+        promptToUse = voiceFile;
+      } else {
+        if (!selectedSampleId) return;
+        if (!isElectronAvailable) throw new Error('Electron API not available');
+        const urlRes = await window.electron.getVoiceSampleUrl(selectedSampleId);
+        if (!urlRes?.success) throw new Error('Failed to resolve voice sample path');
+        const filePath: string = urlRes.result;
+        const dataRes = await window.electron.getFileData(filePath);
+        if (!dataRes?.success) throw new Error('Failed to read voice sample file');
+        const blob = new Blob([dataRes.result], { type: 'audio/wav' });
+        promptToUse = new File([blob], 'voice_prompt.wav', { type: 'audio/wav' });
+      }
+
+      // Revoke old URL if any before generating new one
+      if (audioUrl) {
+        try { URL.revokeObjectURL(audioUrl); } catch {}
+      }
+
+      const result = await generateSpeech(text, promptToUse);
+      if (result.success && result.result) {
+        const raw = result.result as any;
+        const path = typeof raw === 'string' ? raw : (raw?.audioPath || '');
+        const playable = await loadAudioAsBlobUrl(path);
+        setAudioUrl(playable);
+      }
+    } catch (e: any) {
+      console.error('[VoiceCloningDemo] Generate failed:', e);
     }
   };
 
-  const isReady = settings.voiceCloning.enabled && voiceFile && text.trim().length > 0;
+  const isReady = useMemo(() => {
+    if (!settings.voiceCloning.enabled) return false;
+    if (source === 'upload') return !!voiceFile && text.trim().length > 0;
+    return !!selectedSampleId && text.trim().length > 0;
+  }, [settings.voiceCloning.enabled, source, voiceFile, selectedSampleId, text]);
 
   return (
     <div className="card bg-base-100 w-full max-w-2xl shadow-xl">
@@ -64,23 +128,68 @@ const VoiceCloningDemo: React.FC = () => {
           />
         </div>
 
+        {/* Source selection */}
         <div className="form-control">
           <label className="label">
-            <span className="label-text">Voice reference audio</span>
+            <span className="label-text">Voice reference source</span>
           </label>
-          <input
-            type="file"
-            accept="audio/*"
-            onChange={handleFileChange}
-            className="file-input file-input-bordered w-full"
-            disabled={isGenerating}
-          />
-          {voiceFile && (
-            <div className="text-sm text-success mt-2">
-              ✓ {voiceFile.name} selected
-            </div>
-          )}
+          <div className="join">
+            <button className={`btn join-item ${source==='upload'?'btn-active':''}`} onClick={()=>setSource('upload')} disabled={isGenerating}>Upload</button>
+            <button className={`btn join-item ${source==='saved'?'btn-active':''}`} onClick={()=>setSource('saved')} disabled={isGenerating}>Saved Samples</button>
+          </div>
         </div>
+
+        {source === 'upload' ? (
+          <div className="form-control">
+            <label className="label">
+              <span className="label-text">Upload voice reference</span>
+            </label>
+            <input
+              type="file"
+              accept="audio/*"
+              onChange={handleFileChange}
+              className="file-input file-input-bordered w-full"
+              disabled={isGenerating}
+            />
+            {voiceFile && (
+              <div className="text-sm text-success mt-2">
+                ✓ {voiceFile.name} selected
+              </div>
+            )}
+          </div>
+        ) : (
+          <div className="form-control">
+            <label className="label">
+              <span className="label-text">Choose a saved sample</span>
+            </label>
+            <select
+              className="select select-bordered"
+              value={selectedSampleId || ''}
+              onChange={(e)=>setSelectedSampleId(e.target.value || null)}
+              disabled={isGenerating}
+            >
+              {(settings.voiceCloning.voiceSamples || []).length === 0 && (
+                <option value="">No samples found</option>
+              )}
+              {(settings.voiceCloning.voiceSamples || []).map(s => (
+                <option key={s.id} value={s.id}>{s.name || s.id}</option>
+              ))}
+            </select>
+            <div className="mt-2">
+              <button
+                className="btn btn-sm"
+                onClick={async ()=>{
+                  if (!window.electron?.listVoiceSamples) return;
+                  const res = await window.electron.listVoiceSamples();
+                  if (res?.success && Array.isArray(res.result)) {
+                    loadVoiceSamples(res.result);
+                  }
+                }}
+                disabled={isGenerating}
+              >Refresh</button>
+            </div>
+          </div>
+        )}
 
         {settings.voiceCloning.enabled && (
           <div className="grid grid-cols-2 gap-4">

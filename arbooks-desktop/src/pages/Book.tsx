@@ -58,6 +58,16 @@ const BookPage: FC = () => {
     return () => window.removeEventListener('flipbook:onFlip', handler as EventListener);
   }, []);
 
+  // Listen for immersive reading toggle from main process (Ctrl+Alt+F)
+  useEffect(() => {
+    if (window.electron?.onToggleImmersiveReading) {
+      const cleanup = window.electron.onToggleImmersiveReading(() => {
+        updateSettings({ ...settings, isFullScreen: !settings.isFullScreen });
+      });
+      return cleanup;
+    }
+  }, [settings.isFullScreen, updateSettings]);
+
   useEffect(() => {
     if (!bookPath) {
       setError('Book path is not set');
@@ -178,7 +188,7 @@ const BookPage: FC = () => {
         </div>
       </dialog>
 
-      <div className='w-full h-screen flex flex-col bg-base-100' style={{ overflow: 'hidden' }}>
+      <div className='w-full h-screen flex flex-col bg-base-100' style={{ overflow: 'hidden', backgroundColor: '#f8f4e6' }}>
         { /* HEADER */}
         {!settings.isFullScreen && (
           <header className='w-full flex items-center justify-between px-4 py-2 bg-base-200 border-b border-base-300 flex-shrink-0 z-10'>

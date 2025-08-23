@@ -50,10 +50,10 @@ const useVoiceCloningTTS = (): UseVoiceCloningTTSReturn => {
       );
 
       if (result.success) {
-        // The result should contain the path to the generated audio file
-        // In a real implementation, you might convert this to a blob URL for playback
-        setAudioUrl(result.result);
-        return { success: true, result: result.result };
+        // The electron API returns { success, result: { audioPath } }
+        const audioPath = (result.result as any)?.audioPath || result.result;
+        setAudioUrl(audioPath);
+        return { success: true, result: audioPath };
       } else {
         setError(result.error || 'Failed to generate speech');
         return { success: false, error: result.error || 'Failed to generate speech' };

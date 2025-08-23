@@ -37,6 +37,11 @@ declare global {
   getVoiceSamplesDirectory: () => Promise<Result<string>>;
   setVoiceSamplesDirectory: (directory: string) => Promise<Result<string>>;
   listVoiceSamples: () => Promise<Result<VoiceSample[]>>;
+  
+  // Window controls
+  toggleKiosk: () => Promise<Result<any>>;
+  toggleImmersiveReading: () => Promise<Result<any>>;
+  onToggleImmersiveReading: (callback: () => void) => () => void;
     }
   }
 }

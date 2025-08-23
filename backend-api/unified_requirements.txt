@@ -46,3 +46,9 @@ tzdata==2025.2
 urllib3==2.5.0
 xlsxwriter==3.2.5
 youtube-transcript-api==1.2.1
+
+# PyTorch and TTS dependencies
+torch>=2.0.0
+torchaudio>=2.0.0
+transformers>=4.30.0
+safetensors>=0.3.0

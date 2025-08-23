@@ -13,7 +13,7 @@ const App: FC<AppProps> = ({ children }) => {
 
   return (
     <div
-      data-theme={settings.isFullScreen ? "paper" : settings.fontColour}
+      data-theme={"light"}
       style={{
         fontFamily: `'Source Serif 4', serif`
       }}

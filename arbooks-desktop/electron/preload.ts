@@ -1,5 +1,5 @@
 import { contextBridge, ipcRenderer } from 'electron';
-import { BookUploadData } from '../src/types/book';
+import type { BookUploadData } from '../src/types/book';
 
 // Debug logging
 console.log("Preload script starting...");
@@ -36,6 +36,13 @@ const electronAPI = {
 
   // Window controls
   toggleKiosk: () => ipcRenderer.invoke('toggle-kiosk'),
+  toggleImmersiveReading: () => ipcRenderer.invoke('toggle-immersive-reading'),
+  
+  // Listen for immersive reading toggle from main process
+  onToggleImmersiveReading: (callback: () => void) => {
+    ipcRenderer.on('toggle-immersive-reading', callback);
+    return () => ipcRenderer.removeAllListeners('toggle-immersive-reading');
+  },
 };
 
 try {
