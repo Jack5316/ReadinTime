@@ -3,10 +3,10 @@ import sys
 import json
 import logging
 import asyncio
+import tempfile
 import subprocess
 from pathlib import Path
 from typing import Dict, Any, List, Optional
-import tempfile
 
 # Setup frozen imports for bundled application
 from services.frozen_imports import setup_frozen_imports
@@ -22,8 +22,75 @@ except ImportError as e:
     print(f"WhisperX direct import failed: {e}")
 
 
+# -----------------------------
+# Data/models.json resolution
+# -----------------------------
+def _resolve_base_dir() -> Path:
+    base_dir_env = os.environ.get("NUITKA_ONEFILE_TEMP_DIR") or os.environ.get("NUITKA_ONEFILE_PARENT")
+    if base_dir_env:
+        return Path(base_dir_env)
+    if getattr(sys, "frozen", False):
+        return Path(sys.argv[0]).parent
+    return Path(__file__).parent
+
+
+def _resolve_data_dir(base_dir: Path) -> Path:
+    # Prefer explicit env vars
+    for key in ("ARBOOKS_DATA_DIR", "ARBOOKS_DATA_PATH", "DATA_DIR"):
+        val = os.environ.get(key)
+        if val:
+            p = Path(val)
+            if p.exists():
+                return p
+    # Try common locations relative to executable
+    try:
+        exe_dir = Path(sys.argv[0]).resolve().parent
+        candidates = [
+            exe_dir.parent.parent / "Data",  # arBooks/Data when exe at backend-api/dist-cli/
+            exe_dir.parent / "Data",        # fallback: backend-api/Data
+            base_dir / "Data",
+        ]
+        for c in candidates:
+            if c.exists():
+                return c
+    except Exception:
+        pass
+    # Try source tree and cwd
+    try:
+        src_dir = Path(__file__).resolve().parent
+        repo_data = src_dir.parent.parent / "Data"
+        if repo_data.exists():
+            return repo_data
+    except Exception:
+        pass
+    cwd_data = Path.cwd() / "Data"
+    if cwd_data.exists():
+        return cwd_data
+    # Fallback next to base_dir
+    return base_dir / "Data"
+
+
+def _load_models_config(data_dir: Path) -> dict:
+    cfg_path = data_dir / "models.json"
+    if cfg_path.exists():
+        try:
+            return json.loads(cfg_path.read_text(encoding="utf-8"))
+        except Exception:
+            pass
+    # defaults
+    return {
+        "whisperx": {
+            "device": "cpu",
+            "models_dir": str(data_dir / "whisperx_models"),
+            "asr_model": "small",
+            "compute_type": "int8",
+            "batch_size": 4
+        }
+    }
+
+
 class WhisperXService:
-    """Service for transcription and alignment using WhisperX."""
+    """Service for transcription and alignment using local WhisperX models."""
     
     def __init__(self):
         self.logger = logging.getLogger(__name__)
@@ -105,9 +172,9 @@ class WhisperXService:
                         except ImportError as e:
                             self.logger.warning(f"Failed to import WhisperX from bundled source: {e}")
                 
-                # If still not available, fall back to subprocess approach
-                self.logger.info("WhisperX not available via direct import, will use subprocess approach")
-                return True
+                # If still not available, we need to install it
+                self.logger.info("WhisperX not available via direct import, will attempt installation")
+                return await self._install_whisperx()
             
             # In development environment, set up virtual environment
             # Create virtual environment if it doesn't exist
@@ -129,7 +196,16 @@ class WhisperXService:
             except Exception as e:
                 self.logger.info(f"WhisperX not available, setting up: {e}")
             
-            # Install dependencies
+            # Install WhisperX
+            return await self._install_whisperx()
+            
+        except Exception as e:
+            self.logger.error(f"Error setting up WhisperX environment: {e}")
+            return False
+    
+    async def _install_whisperx(self):
+        """Install WhisperX and its dependencies."""
+        try:
             self.logger.info("Installing WhisperX dependencies...")
             
             # Upgrade pip first
@@ -179,7 +255,7 @@ class WhisperXService:
             return True
             
         except Exception as e:
-            self.logger.error(f"Error setting up WhisperX environment: {e}")
+            self.logger.error(f"Error installing WhisperX: {e}")
             return False
     
     async def _run_command(self, command, cwd=None):
@@ -215,17 +291,13 @@ class WhisperXService:
         return result
     
     async def transcribe_audio(self, audio_path: str, output_dir: str, language: str = "auto") -> Dict[str, Any]:
-        """Transcribe audio using WhisperX with word-level timestamps."""
+        """Transcribe audio using local WhisperX with word-level timestamps."""
         try:
             # Ensure output directory exists
             os.makedirs(output_dir, exist_ok=True)
             
-            # If WhisperX is available via direct import, use it directly
-            if WHISPERX_AVAILABLE:
-                return await self._transcribe_direct(audio_path, output_dir, language)
-            else:
-                # Fall back to subprocess approach
-                return await self._transcribe_subprocess(audio_path, output_dir, language)
+            # Use direct WhisperX import for transcription
+            return await self._transcribe_direct(audio_path, output_dir, language)
             
         except Exception as e:
             self.logger.error(f"Error in WhisperX transcription: {e}")
@@ -236,6 +308,24 @@ class WhisperXService:
         try:
             self.logger.info(f"Using direct WhisperX import for transcription")
             
+            # Load config from Data/models.json (whisperx section)
+            base_dir = _resolve_base_dir()
+            data_dir = _resolve_data_dir(base_dir)
+            cfg_all = _load_models_config(data_dir)
+            wx_cfg = cfg_all.get("whisperx", {})
+
+            raw_models_dir = wx_cfg.get("models_dir", "whisperx_models")
+            models_path = Path(raw_models_dir)
+            models_dir = models_path if models_path.is_absolute() else (data_dir / models_path)
+            if models_dir.exists():
+                os.environ.setdefault("HF_HOME", str(models_dir))
+                os.environ.setdefault("TRANSFORMERS_CACHE", str(models_dir))
+                os.environ.setdefault("HUGGINGFACE_HUB_CACHE", str(models_dir))
+                os.environ.setdefault("CT2_CACHES_DIR", str(models_dir))
+                download_root = str(models_dir)
+            else:
+                download_root = None
+
             # Import whisperx functions
             from whisperx import load_audio, load_model, load_align_model, align
             
@@ -244,25 +334,38 @@ class WhisperXService:
             audio = load_audio(audio_path)
             self.logger.info(f"Audio loaded, shape: {audio.shape if hasattr(audio, 'shape') else len(audio)}")
             
+            # Resolve runtime params from config
+            asr_model = wx_cfg.get("asr_model", "small")
+            device = wx_cfg.get("device", "cpu")
+            compute_type = wx_cfg.get("compute_type", "int8")
+            batch_size = int(wx_cfg.get("batch_size", 4))
+
             # Transcribe
             self.logger.info("Loading model...")
-            model = load_model("small", device="cpu", compute_type="int8")
+            if download_root:
+                model = load_model(asr_model, device=device, compute_type=compute_type, download_root=download_root)
+            else:
+                model = load_model(asr_model, device=device, compute_type=compute_type)
             self.logger.info("Model loaded, starting transcription...")
             
             # Handle language parameter - use None for auto-detection instead of "auto"
             transcribe_language = None if language == "auto" else language
             if transcribe_language:
-                result = model.transcribe(audio, batch_size=4, language=transcribe_language)
+                result = model.transcribe(audio, batch_size=batch_size, language=transcribe_language)
             else:
-                result = model.transcribe(audio, batch_size=4)
+                result = model.transcribe(audio, batch_size=batch_size)
             self.logger.info("Transcription completed")
             
             # Align if needed
-            if result.get("language") in ["en", "fr", "de", "es", "it", "ja", "zh", "nl", "uk", "pt"]:
+            if (
+                bool(wx_cfg.get("align", True))
+                and result.get("language") in ["en", "fr", "de", "es", "it", "ja", "zh", "nl", "uk", "pt"]
+            ):
                 self.logger.info("Loading alignment model...")
-                model_a, metadata = load_align_model(language_code=result["language"], device="cpu")
+                model_dir_arg = {"model_dir": str(models_dir)} if models_dir.exists() else {}
+                model_a, metadata = load_align_model(language_code=result["language"], device=device, **model_dir_arg)
                 self.logger.info("Aligning transcription...")
-                result = align(result["segments"], model_a, metadata, audio, device="cpu", return_char_alignments=False)
+                result = align(result["segments"], model_a, metadata, audio, device=device, return_char_alignments=False)
                 self.logger.info("Alignment completed")
             
             # Prepare result in expected format
@@ -291,7 +394,7 @@ class WhisperXService:
             
             return {
                 "success": True,
-                "engine": "whisperx",
+                "engine": "whisperx_local",
                 "words": output_result.get("words", []),
                 "segments": output_result.get("segments", []),
                 "language": output_result.get("language", "unknown"),
@@ -300,134 +403,6 @@ class WhisperXService:
             
         except Exception as e:
             self.logger.error(f"Error in direct WhisperX transcription: {e}")
-            return {"success": False, "error": str(e)}
-    
-    async def _transcribe_subprocess(self, audio_path: str, output_dir: str, language: str = "auto") -> Dict[str, Any]:
-        """Transcribe using subprocess approach (fallback)."""
-        try:
-            # Create transcription script
-            from services.frozen_imports import create_frozen_script_wrapper
-            
-            script_content = f"""
-import whisperx
-import json
-import sys
-import traceback
-
-try:
-    # Load audio
-    print("Loading audio...")
-    audio = whisperx.load_audio(r'{audio_path}')
-    print(f"Audio loaded, shape: {{audio.shape if hasattr(audio, 'shape') else len(audio)}}")
-    
-    # Transcribe
-    print("Loading model...")
-    model = whisperx.load_model("small", device="cpu", compute_type="int8")
-    print("Model loaded, starting transcription...")
-    
-    # Handle language parameter - use None for auto-detection instead of "auto"
-    transcribe_language = None if "{language}" == "auto" else "{language}"
-    if transcribe_language:
-        result = model.transcribe(audio, batch_size=4, language=transcribe_language)
-    else:
-        result = model.transcribe(audio, batch_size=4)
-    print("Transcription completed")
-    
-    # Align if needed
-    if result.get("language") in ["en", "fr", "de", "es", "it", "ja", "zh", "nl", "uk", "pt"]:
-        print("Loading alignment model...")
-        model_a, metadata = whisperx.load_align_model(language_code=result["language"], device="cpu")
-        print("Aligning transcription...")
-        result = whisperx.align(result["segments"], model_a, metadata, audio, device="cpu", return_char_alignments=False)
-        print("Alignment completed")
-    
-    # Prepare result in expected format
-    output_result = {{
-        "success": True,
-        "language": result.get("language", "unknown"),
-        "segments": result.get("segments", []),
-        "words": []
-    }}
-    
-    # Extract words from segments
-    for segment in result.get("segments", []):
-        if "words" in segment:
-            for word in segment["words"]:
-                output_result["words"].append({{
-                    "text": word.get("word", ""),
-                    "start": word.get("start", 0),
-                    "end": word.get("end", 0),
-                    "confidence": word.get("score", 0)
-                }})
-    
-    print(f"Extracted {{len(output_result['words'])}} words from {{len(output_result['segments'])}} segments")
-    print("RESULT:", json.dumps(output_result))
-
-except Exception as e:
-    print(f"Exception occurred: {{str(e)}}")
-    traceback.print_exc()
-    error_result = {{
-        "success": False,
-        "error": str(e)
-    }}
-    print("RESULT:", json.dumps(error_result))
-"""
-            
-            # Create temporary script file with frozen environment support
-            wrapped_script = create_frozen_script_wrapper(script_content)
-            with tempfile.NamedTemporaryFile(mode='w', suffix='.py', delete=False, encoding='utf-8') as f:
-                f.write(wrapped_script)
-                script_path = f.name
-            
-            try:
-                # Run the transcription script
-                self.logger.info(f"Running WhisperX transcription on {audio_path}")
-                result = await self._run_command([
-                    str(self.python_path), script_path
-                ])
-                
-                # Extract the result from stdout
-                output_lines = result.stdout.strip().split('\n')
-                result_line = None
-                for line in output_lines:
-                    if line.startswith("RESULT:"):
-                        result_line = line[7:].strip()  # Remove "RESULT:" prefix
-                        break
-                
-                if result_line:
-                    transcription_result = json.loads(result_line)
-                    
-                    if transcription_result.get("success"):
-                        self.logger.info(f"WhisperX transcription successful, found {len(transcription_result.get('words', []))} words")
-                        
-                        # Create additional output formats
-                        await self._create_output_formats(transcription_result, output_dir)
-                        
-                        return {
-                            "success": True,
-                            "engine": "whisperx",
-                            "words": transcription_result.get("words", []),
-                            "segments": transcription_result.get("segments", []),
-                            "language": transcription_result.get("language", "unknown"),
-                            "output_dir": output_dir
-                        }
-                    else:
-                        return {"success": False, "error": transcription_result.get("error", "Unknown error")}
-                else:
-                    self.logger.error("Could not parse transcription result from script output")
-                    self.logger.error(f"Script stdout: {result.stdout}")
-                    self.logger.error(f"Script stderr: {result.stderr}")
-                    return {"success": False, "error": "Could not parse transcription result"}
-                
-            finally:
-                # Clean up temporary script
-                try:
-                    os.unlink(script_path)
-                except:
-                    pass
-            
-        except Exception as e:
-            self.logger.error(f"Error in subprocess WhisperX transcription: {e}")
             return {"success": False, "error": str(e)}
     
     async def _create_output_formats(self, result: Dict[str, Any], output_dir: str):
@@ -559,7 +534,7 @@ except Exception as e:
         return segments
     
     async def transcribe_and_align(self, audio_path: str, markdown_path: str, output_dir: str) -> Dict[str, Any]:
-        """Main method to transcribe audio using WhisperX and create alignments."""
+        """Main method to transcribe audio using local WhisperX and create alignments."""
         try:
             # Ensure environment is set up
             env_setup = await self.setup_environment()

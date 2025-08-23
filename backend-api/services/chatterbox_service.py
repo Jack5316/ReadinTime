@@ -55,8 +55,9 @@ class ChatterboxTTSService:
         if self._inference_device == 'cpu':
             os.environ['CUDA_VISIBLE_DEVICES'] = ''
             self.logger.info("Using CPU for TTS generation")
-        # Optionally lower audio sample rate to reduce memory/disk usage (e.g., 22050)
-        self._target_sample_rate = int(os.getenv('CHB_TTS_SR', '0')) or None
+        # Optionally lower audio sample rate to reduce memory/disk usage (defaults to 22050 on CPU)
+        env_sr = int(os.getenv('CHB_TTS_SR', '0')) if os.getenv('CHB_TTS_SR') else 0
+        self._target_sample_rate = env_sr or (22050 if self._inference_device == 'cpu' else None)
         # Release strategy: process-per-chunk (dev) is memory-safe; cached (frozen) for speed
         self._release_strategy = os.getenv('CHB_TTS_RELEASE', 'process_per_chunk')
         self._setup_paths()
@@ -567,8 +568,16 @@ finally:
                 }
             
             # Split text into manageable chunks
-            text_chunks = self._split_text_into_chunks(cleaned_text, max_chunk_size=300)
-            self.logger.info(f"Processing {len(text_chunks)} text chunks for {len(cleaned_text)} characters")
+            # Use smaller chunks for voice cloning to reduce memory pressure; allow env override
+            try:
+                if audio_prompt_path:
+                    max_chunk_size = int(os.getenv('CHB_TTS_CHUNK_VC', '160'))
+                else:
+                    max_chunk_size = int(os.getenv('CHB_TTS_CHUNK', '300'))
+            except Exception:
+                max_chunk_size = 160 if audio_prompt_path else 300
+            text_chunks = self._split_text_into_chunks(cleaned_text, max_chunk_size=max_chunk_size)
+            self.logger.info(f"Processing {len(text_chunks)} text chunks (max {max_chunk_size}) for {len(cleaned_text)} characters")
             
             # If only one chunk, process normally
             if len(text_chunks) == 1:
@@ -642,6 +651,54 @@ finally:
                 text_file.write(text)
                 text_file_path = text_file.name
             
+            # Prefer calling the CLI which already honors Data/models.json and local/bundled models
+            try:
+                timeout_env = os.getenv('CHB_TTS_TIMEOUT_SECONDS')
+                if timeout_env and timeout_env.isdigit():
+                    timeout = int(timeout_env)
+                else:
+                    timeout = 1800 if (audio_prompt_path is not None) else 900
+
+                cli_path = Path(__file__).parent.parent / "main_cli.py"
+                # Ensure HF caches go to Data/chatterbox_models as well
+                try:
+                    data_dir = (current_dir.parent / "Data").resolve()
+                    ch_models = (data_dir / "chatterbox_models").resolve()
+                    ch_models.mkdir(parents=True, exist_ok=True)
+                    os.environ.setdefault("HF_HOME", str(ch_models))
+                    os.environ.setdefault("TRANSFORMERS_CACHE", str(ch_models))
+                    os.environ.setdefault("HUGGINGFACE_HUB_CACHE", str(ch_models))
+                except Exception:
+                    pass
+
+                cmd = [
+                    str(self.python_path),
+                    str(cli_path),
+                    "--text-file", text_file_path,
+                    "--out", output_path,
+                    "--device", "cpu",
+                    "--exaggeration", str(exaggeration),
+                    "--cfg-weight", str(cfg_weight),
+                ]
+                if audio_prompt_path:
+                    cmd.extend(["--prompt", str(audio_prompt_path)])
+
+                result_cli = await self._run_command(cmd, cwd=str(current_dir), timeout=int(timeout))
+
+                if result_cli.returncode == 0 and os.path.exists(output_path) and os.path.getsize(output_path) > 0:
+                    file_size = os.path.getsize(output_path)
+                    self.logger.info(f"Chatterbox TTS (CLI) completed successfully: {file_size} bytes")
+                    return {
+                        "success": True,
+                        "engine": "Chatterbox TTS (CLI)",
+                        "output_path": output_path,
+                        "file_size": file_size,
+                    }
+                else:
+                    self.logger.info("CLI path did not succeed; falling back to embedded script execution")
+            except Exception as _cli_exc:
+                self.logger.info(f"CLI execution path failed, falling back to embedded script: {_cli_exc}")
+
             # Create TTS generation script that reads from the text file
             # Force CPU device in dev mode to avoid CUDA issues
             device = 'cpu'
@@ -661,6 +718,12 @@ os.environ.setdefault("OPENBLAS_NUM_THREADS", "1")
 os.environ.setdefault("NUMEXPR_NUM_THREADS", "1")
 os.environ.setdefault("KMP_AFFINITY", "disabled")
 os.environ.setdefault("KMP_DUPLICATE_LIB_OK", "TRUE")
+# Reduce verbose output and disable progress bars; force UTF-8 IO
+os.environ.setdefault("PYTHONWARNINGS", "ignore")
+os.environ.setdefault("TRANSFORMERS_VERBOSITY", "error")
+os.environ.setdefault("HF_HUB_DISABLE_TELEMETRY", "1")
+os.environ.setdefault("TQDM_DISABLE", "1")
+os.environ.setdefault("PYTHONIOENCODING", "utf-8")
 # Aggressive memory management
 os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "max_split_size_mb:128")
 os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
@@ -685,6 +748,28 @@ warnings.filterwarnings("ignore", category=FutureWarning)
 warnings.filterwarnings("ignore", category=UserWarning)
 import logging
 logging.getLogger("transformers").setLevel(logging.ERROR)
+try:
+    # Reconfigure stdio to handle non-ASCII safely
+    if hasattr(sys.stdout, 'reconfigure'):
+        sys.stdout.reconfigure(encoding='utf-8', errors='replace')
+    if hasattr(sys.stderr, 'reconfigure'):
+        sys.stderr.reconfigure(encoding='utf-8', errors='replace')
+except Exception:
+    pass
+try:
+    import tqdm as _tqdm
+    class _NoTQDM:
+        def __init__(self, it=None, *a, **k):
+            self.it = it
+        def __iter__(self):
+            return iter(self.it) if self.it is not None else iter(())
+        def update(self, *a, **k):
+            return None
+        def close(self):
+            return None
+    _tqdm.tqdm = _NoTQDM  # type: ignore
+except Exception:
+    pass
 
 def log_memory_usage(stage):
     """Log current memory usage with more detail"""
@@ -803,8 +888,8 @@ try:
     try:
         model = ChatterboxTTS.from_pretrained(device=device)
         print("Model loaded successfully")
-    except Exception as e:
-        print(f"Model loading failed: {{e}}")
+    except Exception as exc_e:
+        print(f"Model loading failed: {exc_e}")
         # Try to free memory and retry once
         force_memory_cleanup()
         if not check_memory_limit():
@@ -1006,11 +1091,29 @@ except Exception as e:
                 
                 result = await self._run_command([str(self.python_path), script_path], cwd=str(current_dir), timeout=int(timeout))
                 
-                # Log the full output for debugging
-                if result.stdout:
-                    self.logger.info(f"TTS stdout: {result.stdout}")
-                if result.stderr:
-                    self.logger.info(f"TTS stderr: {result.stderr}")
+                # Sanitize and truncate outputs to avoid noisy progress bars and huge logs
+                def _sanitize_output(text: str) -> str:
+                    if not text:
+                        return ""
+                    import re
+                    # Drop tqdm-like "Sampling:" lines and carriage-return updates
+                    lines = text.splitlines()
+                    filtered = []
+                    for ln in lines:
+                        if re.match(r"^\s*Sampling:\s", ln):
+                            continue
+                        filtered.append(ln)
+                    text2 = "\n".join(filtered)
+                    # Truncate to last 2000 chars
+                    return text2[-2000:] if len(text2) > 2000 else text2
+
+                safe_stdout = _sanitize_output(result.stdout)
+                safe_stderr = _sanitize_output(result.stderr)
+
+                if safe_stdout:
+                    self.logger.info(f"TTS stdout (sanitized): {safe_stdout}")
+                if safe_stderr:
+                    self.logger.info(f"TTS stderr (sanitized): {safe_stderr}")
                 
                 if result.returncode == 0 and "CHATTERBOX_SUCCESS" in result.stdout:
                     # Check if output file was created
@@ -1041,7 +1144,7 @@ except Exception as e:
                     }
 
                 else:
-                    error_msg = result.stderr or result.stdout or "Unknown error"
+                    error_msg = safe_stderr or safe_stdout or "Unknown error"
                     
                     # Check for specific error types
                     if "3221225477" in str(result.returncode) or "access violation" in error_msg.lower():
@@ -1249,7 +1352,7 @@ except Exception as e:
                 temp_audio_file = os.path.join(output_dir, f"temp_chunk_{i:04d}.wav")
                 temp_audio_files.append(temp_audio_file)
                 
-                # Generate speech for this chunk
+                # Generate speech for this chunk (with retry-on-split fallback)
                 chunk_result = await self._generate_single_chunk(
                     chunk, 
                     temp_audio_file,
@@ -1257,6 +1360,51 @@ except Exception as e:
                     cfg_weight,
                     audio_prompt_path
                 )
+                if not chunk_result.get("success"):
+                    err_msg = str(chunk_result.get("error", ""))
+                    # If we hit memory/access violation, try to split this chunk smaller and retry
+                    if ("memory" in err_msg.lower()) or ("access violation" in err_msg.lower()):
+                        self.logger.warning(f"Chunk {i+1} failed due to memory; retrying with smaller subchunks")
+                        subchunks = self._split_text_into_chunks(chunk, max_chunk_size=max(80, len(chunk)//2))
+                        sub_temp_files = []
+                        retry_failed = False
+                        for j, sub in enumerate(subchunks):
+                            sub_temp = os.path.join(output_dir, f"temp_chunk_{i:04d}_{j:02d}.wav")
+                            sub_temp_files.append(sub_temp)
+                            sub_res = await self._generate_single_chunk(
+                                sub,
+                                sub_temp,
+                                exaggeration,
+                                cfg_weight,
+                                audio_prompt_path
+                            )
+                            if not sub_res.get("success"):
+                                retry_failed = True
+                                self.logger.error(f"Subchunk {j+1}/{len(subchunks)} for chunk {i+1} failed: {sub_res.get('error')}")
+                                break
+                        if not retry_failed:
+                            # Combine subchunks into the original temp file path
+                            combine_sub = await self._combine_audio_files(sub_temp_files, temp_audio_file)
+                            # Cleanup sub temp files
+                            for fp in sub_temp_files:
+                                try:
+                                    if os.path.exists(fp):
+                                        os.remove(fp)
+                                except:
+                                    pass
+                            if not combine_sub.get("success"):
+                                self.logger.error(f"Failed to combine subchunks for chunk {i+1}: {combine_sub.get('error')}")
+                                chunk_result = combine_sub
+                            else:
+                                chunk_result = {"success": True, "output_path": temp_audio_file}
+                        else:
+                            # Cleanup partial sub temp files
+                            for fp in sub_temp_files:
+                                try:
+                                    if os.path.exists(fp):
+                                        os.remove(fp)
+                                except:
+                                    pass
                 
                 if not chunk_result["success"]:
                     self.logger.error(f"Failed to generate chunk {i+1}: {chunk_result['error']}")
@@ -1385,7 +1533,8 @@ except Exception as e:
     traceback.print_exc()
     sys.exit(1)
 '''
-            combine_script_norm = "\n".join(line.lstrip() for line in textwrap.dedent(combine_script_raw).splitlines())
+            # Preserve relative indentation of the try: block when wrapping
+            combine_script_norm = textwrap.dedent(combine_script_raw).strip("\n")
             combine_script = "if True:\n" + textwrap.indent(combine_script_norm, "    ")
             
             # Write script to temporary file

@@ -1,7 +1,6 @@
 # Services package
+# Keep this package lightweight to avoid importing heavy optional dependencies
+# during tools like packagers/compilers. Import submodules explicitly where
+# needed, e.g. `from services.pdf_processor import PDFProcessor`.
 
-from .chatterbox_service import ChatterboxTTSService
-from .pdf_processor import PDFProcessor
-from .tts_service import TTSService
-from .whisperx_service import WhisperXService
-from .pipeline_manager import PipelineManager
+__all__: list[str] = []

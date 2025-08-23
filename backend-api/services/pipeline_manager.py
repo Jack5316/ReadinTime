@@ -123,6 +123,14 @@ class PipelineManager:
             
             update_progress("pdf_conversion", 25, f"'{safe_title}' converted to markdown successfully")
             
+            # Stage 2.5: Extract PDF Cover
+            update_progress("cover_extraction", 27, f"Extracting cover image for '{safe_title}'...")
+            cover_filename = await self.pdf_processor.extract_pdf_cover(pdf_path, output_dir)
+            if cover_filename:
+                update_progress("cover_extraction", 30, f"Cover image extracted for '{safe_title}': {cover_filename}")
+            else:
+                update_progress("cover_extraction", 30, f"No cover image found for '{safe_title}', will use placeholder")
+            
             # Stage 3: TTS Generation (with optional voice cloning)
             if voice_cloning_options and voice_cloning_options.get("enabled"):
                 update_progress("tts_generation", 30, f"Generating voice cloned audio for '{safe_title}'...")
@@ -195,7 +203,7 @@ class PipelineManager:
             # Stage 5: Save Metadata
             update_progress("metadata_save", 85, f"Saving metadata for '{safe_title}'...")
             
-            metadata_result = await self._save_book_metadata(book_data, output_dir)
+            metadata_result = await self._save_book_metadata(book_data, output_dir, cover_filename)
             if not metadata_result["success"]:
                 return {"success": False, "error": f"Metadata save failed: {metadata_result.get('error')}"}
             
@@ -217,7 +225,7 @@ class PipelineManager:
             update_progress("failed", -1, error_msg)
             return {"success": False, "error": error_msg}
     
-    async def _save_book_metadata(self, book_data: Any, output_dir: str) -> Dict[str, Any]:
+    async def _save_book_metadata(self, book_data: Any, output_dir: str, cover_filename: str = "") -> Dict[str, Any]:
         """Save book metadata to info.json file."""
         try:
             # Import here to avoid circular imports
@@ -231,7 +239,7 @@ class PipelineManager:
                 author=book_data.author,
                 description=book_data.description,
                 folder=create_safe_folder_name(book_data.title),
-                cover=""  # TODO: Generate cover image
+                cover=cover_filename  # Use the extracted cover filename
             )
             
             # Save metadata

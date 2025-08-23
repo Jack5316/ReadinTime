@@ -571,6 +571,136 @@ As the final note played, Maya found herself back in the dusty attic. But in her
 
         return story_text.strip()
     
+    async def extract_pdf_cover(self, pdf_path: str, output_dir: str) -> str:
+        """Extract the first page of a PDF as a cover image."""
+        try:
+            # Create a temporary script to extract cover using PyPDF2 and Pillow
+            script_content = '''
+import sys
+import os
+from pathlib import Path
+from PyPDF2 import PdfReader
+from PIL import Image, ImageDraw, ImageFont
+import io
+
+def extract_cover(pdf_path, output_dir):
+    try:
+        # Try to extract first page as image using PyPDF2
+        reader = PdfReader(pdf_path)
+        if len(reader.pages) == 0:
+            return ""
+        
+        # Get the first page
+        page = reader.pages[0]
+        
+        # Try to extract images from the page
+        if '/XObject' in page['/Resources']:
+            xObject = page['/Resources']['/XObject'].get_object()
+            
+            for obj in xObject:
+                if xObject[obj]['/Subtype'] == '/Image':
+                    try:
+                        # Extract image data
+                        img_data = xObject[obj].get_data()
+                        
+                        # Try to determine image format and save
+                        if xObject[obj]['/Filter'] == '/DCTDecode':
+                            # JPEG
+                            cover_path = os.path.join(output_dir, "cover.jpg")
+                            with open(cover_path, 'wb') as f:
+                                f.write(img_data)
+                            return "cover.jpg"
+                        elif xObject[obj]['/Filter'] == '/JPXDecode':
+                            # JPEG2000
+                            cover_path = os.path.join(output_dir, "cover.jp2")
+                            with open(cover_path, 'wb') as f:
+                                f.write(img_data)
+                            return "cover.jp2"
+                        elif xObject[obj]['/Filter'] == '/FlateDecode':
+                            # PNG or other compressed format
+                            try:
+                                img = Image.open(io.BytesIO(img_data))
+                                cover_path = os.path.join(output_dir, "cover.png")
+                                img.save(cover_path, "PNG")
+                                return "cover.png"
+                            except:
+                                pass
+                    except Exception as e:
+                        print(f"Error processing image object: {e}")
+                        continue
+        
+        # If no images found, create a text-based cover from the first page
+        try:
+            text = page.extract_text()
+            if text:
+                # Create a simple text-based cover
+                img = Image.new('RGB', (400, 600), color='white')
+                draw = ImageDraw.Draw(img)
+                
+                # Try to use a default font, fallback to basic if not available
+                try:
+                    font = ImageFont.truetype("arial.ttf", 24)
+                except:
+                    font = ImageFont.load_default()
+                
+                # Draw title (first line of text)
+                lines = text.split('\\n')[:3]  # Take first 3 lines
+                y_position = 50
+                for line in lines[:2]:  # First two lines as title
+                    if line.strip():
+                        # Center the text
+                        bbox = draw.textbbox((0, 0), line.strip(), font=font)
+                        text_width = bbox[2] - bbox[0]
+                        x_position = (400 - text_width) // 2
+                        draw.text((x_position, y_position), line.strip(), fill='black', font=font)
+                        y_position += 40
+                
+                # Add a decorative border
+                draw.rectangle([20, 20, 380, 580], outline='gray', width=2)
+                
+                cover_path = os.path.join(output_dir, "cover.png")
+                img.save(cover_path, "PNG")
+                return "cover.png"
+        except Exception as e:
+            print(f"Error creating text-based cover: {e}")
+        
+        return ""
+        
+    except Exception as e:
+        print(f"Error extracting cover: {e}")
+        return ""
+
+if __name__ == "__main__":
+    if len(sys.argv) != 3:
+        print("Usage: script.py <pdf_path> <output_dir>")
+        sys.exit(1)
+    
+    pdf_path = sys.argv[1]
+    output_dir = sys.argv[2]
+    
+    result = extract_cover(pdf_path, output_dir)
+    print(result)
+'''
+            
+            # Run the cover extraction script
+            result = await self._run_pdf_command(script_content, pdf_path, timeout=60)
+            
+            if result.get("success") and result.get("result"):
+                # Check if any cover file was created
+                cover_extensions = ["cover.png", "cover.jpg", "cover.jp2"]
+                for ext in cover_extensions:
+                    cover_path = os.path.join(output_dir, ext)
+                    if os.path.exists(cover_path):
+                        self.logger.info(f"Successfully extracted cover image to {cover_path}")
+                        return ext
+            
+            self.logger.warning("Cover extraction failed, will use placeholder")
+            return ""
+            
+        except Exception as e:
+            self.logger.error(f"Error extracting PDF cover: {e}")
+            return ""
+
     async def convert_pdf_to_markdown(self, pdf_path: str, output_dir: str) -> Dict[str, Any]:
         """Convert PDF to markdown and save to output directory."""
         try:

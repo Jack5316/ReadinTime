@@ -471,6 +471,62 @@ async def upload_pdf(
         logger.error(f"Error uploading PDF: {e}")
         return Result(success=False, error=str(e))
 
+@app.post("/api/books/regenerate-covers")
+async def regenerate_book_covers(book_path: str = Form(...)):
+    """Regenerate cover images for all existing books in the library"""
+    try:
+        if not os.path.exists(book_path):
+            return Result(success=False, error="Book path does not exist")
+        
+        # Get all book folders
+        book_folders = []
+        for item in os.listdir(book_path):
+            item_path = os.path.join(book_path, item)
+            if os.path.isdir(item_path):
+                info_path = os.path.join(item_path, 'info.json')
+                if os.path.exists(info_path):
+                    book_folders.append(item)
+        
+        results = []
+        for folder in book_folders:
+            try:
+                folder_path = os.path.join(book_path, folder)
+                info_path = os.path.join(folder_path, 'info.json')
+                
+                # Read existing book info
+                with open(info_path, 'r', encoding='utf-8') as f:
+                    book_info = json.load(f)
+                
+                # Look for PDF file in the folder
+                pdf_files = [f for f in os.listdir(folder_path) if f.lower().endswith('.pdf')]
+                if not pdf_files:
+                    results.append({"folder": folder, "success": False, "error": "No PDF found"})
+                    continue
+                
+                pdf_path = os.path.join(folder_path, pdf_files[0])
+                
+                # Extract cover
+                cover_filename = await pdf_processor.extract_pdf_cover(pdf_path, folder_path)
+                
+                if cover_filename:
+                    # Update book info with cover filename
+                    book_info['cover'] = cover_filename
+                    with open(info_path, 'w', encoding='utf-8') as f:
+                        json.dump(book_info, f, indent=2)
+                    
+                    results.append({"folder": folder, "success": True, "cover": cover_filename})
+                else:
+                    results.append({"folder": folder, "success": False, "error": "Cover extraction failed"})
+                    
+            except Exception as e:
+                results.append({"folder": folder, "success": False, "error": str(e)})
+        
+        return Result(success=True, result=results)
+        
+    except Exception as e:
+        logger.error(f"Error regenerating covers: {e}")
+        return Result(success=False, error=str(e))
+
 @app.post("/api/books/convert-pdf")
 async def convert_pdf_to_markdown(
     filename: str = Form(...),
@@ -493,6 +549,13 @@ async def convert_pdf_to_markdown(
         result = await pdf_processor.convert_pdf_to_markdown(pdf_path, output_dir)
         
         if result["success"]:
+            # Extract cover image
+            cover_filename = await pdf_processor.extract_pdf_cover(pdf_path, output_dir)
+            if cover_filename:
+                logger.info(f"Successfully extracted cover image: {cover_filename}")
+            else:
+                logger.info("No cover image extracted, will use placeholder")
+            
             return Result(success=True, result=f"Converted {filename} successfully")
         else:
             return Result(success=False, error=result["error"])
